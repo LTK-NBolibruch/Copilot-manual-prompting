@@ -1,24 +1,21 @@
-import requests
+"""Example local client using the official OpenAI SDK (pip install openai)."""
+from openai import OpenAI
 
-# 1. The address of your local API
-api_url = "http://localhost:5000/api/prompt"
+client = OpenAI(base_url="http://127.0.0.1:5000/v1", api_key="local")  # key is ignored
 
-# 2. The message you want to send
-data_payload = {
-    "prompt": "What are three fun facts about the ocean?",
-    "debug": False  # Change to True if you want to watch the browser type
-}
+resp = client.chat.completions.create(
+    model="m365-copilot",
+    messages=[
+        {"role": "system", "content": "Answer in at most three bullet points."},
+        {"role": "user", "content": "What are three fun facts about the ocean?"},
+    ],
+)
+print(resp.choices[0].message.content)
 
-print("Sending message to your local Copilot API...")
-
-# 3. Send the POST request
-response = requests.post(api_url, json=data_payload)
-
-# 4. Read the response
-if response.status_code == 200:
-    # Extract the answer from the JSON data
-    answer = response.json().get("response")
-    print("\nCopilot says:\n")
-    print(answer)
-else:
-    print(f"Something went wrong! Error: {response.text}")
+# Live streaming: text is printed as Copilot writes it
+for chunk in client.chat.completions.create(
+        model="m365-copilot", stream=True,
+        messages=[{"role": "user", "content": "Write a short paragraph about trains."}]):
+    if chunk.choices:
+        print(chunk.choices[0].delta.content or "", end="", flush=True)
+print()

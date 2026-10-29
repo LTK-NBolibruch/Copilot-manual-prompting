@@ -1,2 +1,4 @@
-flask
-playwright
+playwright>=1.40
+markdownify>=0.11   # optional: keeps headings/tables/links in non-streamed replies
+pytest>=7           # optional: tests
+openai>=1.0         # optional: only for client.py and the SDK test

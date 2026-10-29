@@ -1,0 +1,6 @@
+playwright_profile/
+logs/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
