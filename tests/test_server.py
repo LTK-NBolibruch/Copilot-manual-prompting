@@ -19,7 +19,7 @@ import server  # noqa: E402
 from copilot import CopilotError, LoginRequired, PromptTooLong  # noqa: E402
 
 REPLY = "Hello from Copilot! " * 10
-PIECES = ["Hello ", "from ", "Copilot! ", "This ", "is ", "streamed."]
+PIECES = ["## Hello", "\n\nThis is **streamed**.", "\n\n- one\n- two"]
 
 
 class FakeSession:
@@ -31,12 +31,14 @@ class FakeSession:
     def submit(self, prompt, on_delta=None):
         self.last_prompt = prompt
         fut = Future()
-        fut.streamed_text = ""
+        fut.streamed_text, fut.truncated = "", False
         fut.set_running_or_notify_cancel()
 
         def work():
             if "slow" in prompt:
                 time.sleep(0.3)
+            if "truncated" in prompt:
+                fut.truncated = True
             if "boom" in prompt:
                 fut.set_exception(CopilotError("selector missing"))
             elif "login" in prompt:
@@ -44,7 +46,7 @@ class FakeSession:
             elif "toolong" in prompt:
                 fut.set_exception(PromptTooLong("Copilot accepted only 10 of 20 characters"))
             elif "nodeltas" in prompt:
-                fut.set_result(REPLY)  # e.g. reply re-rendered before any delta could be sent
+                fut.set_result(REPLY)
             elif on_delta:
                 for p in PIECES:
                     on_delta(p)
@@ -55,9 +57,6 @@ class FakeSession:
                 fut.set_result(REPLY)
         threading.Thread(target=work, daemon=True).start()
         return fut
-
-    def ask(self, prompt):
-        return self.submit(prompt).result()
 
 
 @pytest.fixture()
@@ -89,6 +88,10 @@ def sse_events(body):
     return [l[6:] for l in body.splitlines() if l.startswith("data: ")]
 
 
+def stream_chunks(body):
+    return [json.loads(e) for e in sse_events(body)[:-1]]
+
+
 def test_models(url):
     s, b = req(url, "GET", "/v1/models")
     assert s == 200 and b["object"] == "list" and b["data"][0]["id"] == "m365-copilot"
@@ -102,6 +105,14 @@ def test_completion_shape(url):
     assert c["message"]["role"] == "assistant" and c["message"]["content"] == REPLY
     assert c["finish_reason"] == "stop" and "usage" in b
     assert server.Handler.session.last_prompt == "hi"
+
+
+def test_truncated_reply_finish_reason_length(url):
+    s, b = req(url, "POST", "/v1/chat/completions", user("truncated"))
+    assert s == 200 and b["choices"][0]["finish_reason"] == "length"
+    s, body = req(url, "POST", "/v1/chat/completions", user("truncated", stream=True), raw=True)
+    finishes = [c["choices"][0]["finish_reason"] for c in stream_chunks(body) if c["choices"]]
+    assert finishes[-1] == "length"
 
 
 def test_flatten_system_and_history(url):
@@ -119,40 +130,47 @@ def test_live_streaming(url):
     s, body = req(url, "POST", "/v1/chat/completions",
                   user("hi", stream=True, stream_options={"include_usage": True}), raw=True)
     assert s == 200
-    events = sse_events(body)
-    assert events[-1] == "[DONE]"
-    chunks = [json.loads(e) for e in events[:-1]]
+    assert sse_events(body)[-1] == "[DONE]"
+    chunks = stream_chunks(body)
     assert chunks[0]["choices"][0]["delta"] == {"role": "assistant", "content": ""}
     contents = [c["choices"][0]["delta"].get("content") for c in chunks[1:] if c["choices"]
                 and c["choices"][0]["delta"].get("content")]
-    assert contents == PIECES                       # one SSE chunk per delta, in order
+    assert contents == PIECES
     assert any(c["choices"] and c["choices"][0]["finish_reason"] == "stop" for c in chunks)
     assert "usage" in chunks[-1]
 
 
+def test_stream_delivers_every_delta_before_stop(url):
+    """All content chunks precede the finish chunk - nothing queued is dropped."""
+    s, body = req(url, "POST", "/v1/chat/completions", user("slow", stream=True), raw=True)
+    chunks = [c for c in stream_chunks(body) if c["choices"]]
+    finish_idx = next(i for i, c in enumerate(chunks) if c["choices"][0]["finish_reason"])
+    text = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks[:finish_idx])
+    assert text == "".join(PIECES)
+    assert finish_idx == len(chunks) - 1
+
+
 def test_stream_chunks_arrive_incrementally(url):
-    """First content must arrive before the reply is finished."""
     host, port = url.split("//")[1].split(":")
     conn = http.client.HTTPConnection(host, int(port))
     t0 = time.time()
     conn.request("POST", "/v1/chat/completions", json.dumps(user("slow", stream=True)),
                  {"Content-Type": "application/json"})
     r = conn.getresponse()
-    first_content_at = None
+    first_content_at = done_at = None
     for line in r:
         line = line.decode().strip()
-        if line.startswith("data: {") and '"content": "Hello' in line:
+        if first_content_at is None and line.startswith("data: {") and '"content": "## Hello"' in line:
             first_content_at = time.time() - t0
         if line == "data: [DONE]":
             done_at = time.time() - t0
             break
-    assert first_content_at is not None and first_content_at < done_at - 0.15
+    assert first_content_at is not None and first_content_at < done_at - 0.05
 
 
 def test_stream_falls_back_to_whole_reply(url):
     s, body = req(url, "POST", "/v1/chat/completions", user("nodeltas", stream=True), raw=True)
-    chunks = [json.loads(e) for e in sse_events(body)[:-1]]
-    text = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks if c["choices"])
+    text = "".join(c["choices"][0]["delta"].get("content", "") for c in stream_chunks(body) if c["choices"])
     assert text == REPLY
 
 
@@ -229,3 +247,12 @@ def test_openai_sdk(url):
                   c.chat.completions.create(model="m", stream=True, messages=[{"role": "user", "content": "hi"}])
                   if ch.choices)
     assert out == "".join(PIECES)
+
+
+def test_think_blocks_stripped_from_history(url):
+    msgs = [{"role": "user", "content": "Q1"},
+            {"role": "assistant", "content": "<think>\nprivate reasoning\n</think>\n\nA1"},
+            {"role": "user", "content": "Q2"}]
+    req(url, "POST", "/v1/chat/completions", {"model": "x", "messages": msgs})
+    p = server.Handler.session.last_prompt
+    assert "Assistant: A1" in p and "private reasoning" not in p

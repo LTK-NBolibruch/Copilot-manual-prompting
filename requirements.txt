@@ -1,4 +1,4 @@
 playwright>=1.40
-markdownify>=0.11   # optional: keeps headings/tables/links in non-streamed replies
+markdownify>=0.11   # recommended: markdown replies and markdown streaming (falls back to plain text without it)
 pytest>=7           # optional: tests
 openai>=1.0         # optional: only for client.py and the SDK test

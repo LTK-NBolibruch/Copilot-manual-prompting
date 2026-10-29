@@ -15,16 +15,16 @@ from copilot import CopilotSession
 
 def run(session, prompt, stream):
     if not stream:
-        print(session.ask(prompt))
-        return
-    fut = session.submit(prompt, on_delta=lambda d: print(d, end="", flush=True))
-    final = fut.result()
-    if not fut.streamed_text:
-        print(final, end="")
-    elif final != fut.streamed_text.strip():
-        print("\n\n[note: Copilot re-rendered the reply; streamed text may differ slightly from the final version]",
-              end="")
-    print()
+        fut = session.submit(prompt)
+        print(fut.result(timeout=session.result_timeout()))
+    else:
+        fut = session.submit(prompt, on_delta=lambda d: print(d, end="", flush=True))
+        final = fut.result(timeout=session.result_timeout())
+        if not fut.streamed_text:
+            print(final, end="")
+        print()
+    if fut.truncated:
+        print("\n[note: Copilot was still writing when COPILOT_REPLY_TIMEOUT ran out; the reply may be incomplete]")
 
 
 def main():

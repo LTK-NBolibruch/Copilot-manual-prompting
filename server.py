@@ -17,8 +17,10 @@ import json
 import logging
 import os
 import queue
+import re
 import time
 import uuid
+from concurrent.futures import TimeoutError as FutureTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import config
@@ -46,7 +48,19 @@ def flatten_messages(messages):
             return "\n".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
         return content or ""
 
-    msgs = [m for m in messages if isinstance(m, dict) and text_of(m.get("content")).strip()]
+    def strip_reasoning(text):
+        # Clients may send earlier replies back with their <think>...</think> block; don't re-send it.
+        tag = re.escape(config.THINK_TAG)
+        return re.sub(rf"<{tag}>.*?</{tag}>\s*", "", text, flags=re.S)
+
+    msgs = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") == "assistant":
+            m = {**m, "content": strip_reasoning(text_of(m.get("content")))}
+        if text_of(m.get("content")).strip():
+            msgs.append(m)
     if not msgs:
         raise ValueError("'messages' must contain at least one message with text content.")
 
@@ -73,17 +87,26 @@ def error_status(exc):
         return 400, "invalid_request_error", "context_length_exceeded"
     if isinstance(exc, LoginRequired):
         return 503, "service_unavailable", "login_required"
-    if isinstance(exc, TimeoutError):
+    if isinstance(exc, (TimeoutError, FutureTimeout)):
         return 504, "timeout", "timeout"
     if isinstance(exc, CopilotError):
         return 502, "api_error", "automation_failed"
     return 500, "api_error", "internal_error"
 
 
+def finish_reason(fut):
+    """'length' if Copilot was still writing when COPILOT_REPLY_TIMEOUT ran out."""
+    return "length" if getattr(fut, "truncated", False) else "stop"
+
+
+def result_timeout():
+    return config.REPLY_TIMEOUT + config.START_TIMEOUT + config.INPUT_TIMEOUT + 120
+
+
 class Handler(BaseHTTPRequestHandler):
     session: CopilotSession = None
     protocol_version = "HTTP/1.1"
-    server_version = "CopilotLocal/1.1"
+    server_version = "CopilotLocal/1.4"
 
     # ---------- helpers
     def _json(self, status, obj):
@@ -177,28 +200,34 @@ class Handler(BaseHTTPRequestHandler):
             return self._stream(prompt, model, cid, created, body, t0)
 
         try:
-            text = self.session.ask(prompt)
+            fut = self.session.submit(prompt)
+            text = fut.result(timeout=result_timeout())
         except Exception as e:
             status, etype, code = error_status(e)
             if status == 500:
                 log.exception("Unhandled error")
             return self._error(status, str(e), etype, code)
 
-        log.info("completion %s %.1fs in=%d out=%d chars", cid, time.time() - t0, len(prompt), len(text))
+        reason = finish_reason(fut)
+        log.info("completion %s %.1fs in=%d out=%d chars finish=%s",
+                 cid, time.time() - t0, len(prompt), len(text), reason)
         self._json(200, {
             "id": cid, "object": "chat.completion", "created": created, "model": model,
             "system_fingerprint": None,
             "choices": [{"index": 0, "message": {"role": "assistant", "content": text, "refusal": None},
-                         "logprobs": None, "finish_reason": "stop"}],
+                         "logprobs": None, "finish_reason": reason}],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         })
 
     def _stream(self, prompt, model, cid, created, body, t0):
         """Live Server-Sent Events.
 
-        The worker pushes each newly written piece of Copilot's reply into a
-        queue as it appears on the page; this thread forwards them as
-        chat.completion.chunk events, with keep-alive comments while idle.
+        The worker pushes each new piece of Copilot's reply into a queue as it
+        appears on the page (finished markdown blocks, or plain text in text
+        mode) and, when the reply ends, whatever the client has not received
+        yet. This thread forwards them as chat.completion.chunk events, with
+        keep-alive comments while idle. The queue is drained completely before
+        the final chunk is sent.
         """
         events: "queue.Queue" = queue.Queue()
         try:
@@ -206,6 +235,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             status, etype, code = error_status(e)
             return self._error(status, str(e), etype, code)
+        # Runs after the worker's last on_delta call, so _DONE is always queued last.
         fut.add_done_callback(lambda _f: events.put(_DONE))
 
         self.send_response(200)
@@ -250,16 +280,18 @@ class Handler(BaseHTTPRequestHandler):
                 log.warning("stream %s failed: %d %s: %s", cid, status, code, exc)
                 send({"error": {"message": str(exc), "type": etype, "param": None, "code": code}})
             else:
-                # If nothing was streamed (e.g. reply rewritten before first poll), send it whole.
+                # If nothing was streamed, send the whole reply at once.
                 if sent_chars == 0 and fut.result():
+                    sent_chars = len(fut.result())
                     chunk({"content": fut.result()})
-                chunk({}, "stop")
+                reason = finish_reason(fut)
+                chunk({}, reason)
                 if (body.get("stream_options") or {}).get("include_usage"):
                     send({"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
                           "choices": [], "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}})
                 ttft = f"{first_token_at - t0:.1f}s" if first_token_at else "n/a"
-                log.info("stream %s %.1fs first-text=%s in=%d streamed=%d final=%d chars",
-                         cid, time.time() - t0, ttft, len(prompt), sent_chars, len(fut.result()))
+                log.info("stream %s %.1fs first-text=%s in=%d streamed=%d final=%d chars finish=%s",
+                         cid, time.time() - t0, ttft, len(prompt), sent_chars, len(fut.result()), reason)
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
