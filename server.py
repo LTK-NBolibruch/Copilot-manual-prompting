@@ -2,6 +2,7 @@
 
     python server.py            # http://127.0.0.1:5000/v1
     python server.py --show     # watch the browser
+    python manager.py           # several sessions on consecutive ports, with a small window
 
 Point any OpenAI client at base_url="http://127.0.0.1:5000/v1" with any api_key
 (it is ignored - no authentication, localhost only).
@@ -17,12 +18,15 @@ import json
 import logging
 import os
 import queue
+import sys
+import threading
 import time
 import uuid
 from concurrent.futures import TimeoutError as FutureTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import config
+import procs
 from conversations import (ConversationStore, fingerprint, history_key, log_conversation, strip_reasoning,
                            text_of)
 from copilot import CopilotSession, CopilotError, LoginRequired, PromptTooLong
@@ -32,6 +36,7 @@ log = logging.getLogger("server")
 MAX_BODY = 5_000_000
 KEEPALIVE_SECONDS = 10
 CREATED = int(time.time())
+LOG_FORMAT = "%(asctime)s %(levelname)s [%(threadName)s] %(name)s: %(message)s"
 _DONE = object()  # end-of-stream sentinel
 
 
@@ -108,7 +113,11 @@ class Handler(BaseHTTPRequestHandler):
     session: CopilotSession = None
     store: ConversationStore = None   # None = resuming disabled
     protocol_version = "HTTP/1.1"
-    server_version = "CopilotLocal/1.9"
+    server_version = "CopilotLocal/2.0"
+
+    @property
+    def port(self):
+        return self.server.server_address[1]
 
     # ---------- helpers
     def _json(self, status, obj):
@@ -122,7 +131,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _error(self, status, message, etype="invalid_request_error", code=None):
         # OpenAI error shape
-        log.warning("%d %s: %s", status, code or etype, message)
+        log.warning(":%d %d %s: %s", self.port, status, code or etype, message)
         self._json(status, {"error": {"message": message, "type": etype, "param": None, "code": code}})
 
     def _read_body(self):
@@ -173,7 +182,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- conversation resuming
     def _plan_resume(self, messages, model=None):
-        """resume dict for CopilotSession.submit(), or None to start a new chat."""
+        """resume dict for CopilotSession.submit(), or None to start a new chat.
+        A returned chat is claimed; _submit releases it when the reply is done."""
         if self.store is None:
             return None
         msgs = clean_messages(messages)
@@ -189,7 +199,23 @@ class Handler(BaseHTTPRequestHandler):
             log.info("Chat %s was answered by %r, this request asks for %r - starting a new chat",
                      hit["url"], hit["model"], model)
             return None
+        if not self.store.claim(hit["url"]):
+            log.info("Chat %s is being continued by another request right now - starting a new chat", hit["url"])
+            return None
         return {**hit, "prompt": text_of(msgs[-1]["content"]).strip()}
+
+    def _submit(self, prompt, resume, select, on_delta=None):
+        """session.submit(), releasing the claimed chat (if any) when the reply is done."""
+        try:
+            fut = self.session.submit(prompt, on_delta=on_delta, resume=resume, model=select)
+        except Exception:
+            if resume:
+                self.store.release(resume["url"])
+            raise
+        if resume:
+            store, url = self.store, resume["url"]
+            fut.add_done_callback(lambda _f: store.release(url))
+        return fut
 
     def _record(self, messages, fut, client_text, resume):
         """Remember which Copilot chat now holds messages + this reply. Never raises: a failure
@@ -218,7 +244,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         p = self._path()
         if p in ("/health", "/v1/health"):
-            return self._json(200, {"status": "ok", "worker_alive": self.session.alive,
+            return self._json(200, {"status": "ok", "port": self.port, "worker_alive": self.session.alive,
                                     "queue_depth": self.session.pending,
                                     "current_model": self.session.current_model,
                                     "models": self.session.model_names(),
@@ -277,7 +303,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._stream(prompt, resume, select, messages, requested, cid, created, body, t0)
 
         try:
-            fut = self.session.submit(prompt, resume=resume, model=select)
+            fut = self._submit(prompt, resume, select)
             text = fut.result(timeout=result_timeout())
         except Exception as e:
             status, etype, code = error_status(e)
@@ -287,7 +313,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._record(messages, fut, text, resume)
         reason = finish_reason(fut)
-        log.info("completion %s %.1fs in=%d out=%d chars finish=%s %s model=%s",
+        log.info(":%d completion %s %.1fs in=%d out=%d chars finish=%s %s model=%s", self.port,
                  cid, time.time() - t0, len(prompt), len(text), reason,
                  "resumed" if getattr(fut, "resumed", False) else "new-chat", getattr(fut, "model", None))
         self._json(200, {
@@ -309,7 +335,7 @@ class Handler(BaseHTTPRequestHandler):
         """
         events: "queue.Queue" = queue.Queue()
         try:
-            fut = self.session.submit(prompt, on_delta=events.put, resume=resume, model=select)
+            fut = self._submit(prompt, resume, select, on_delta=events.put)
         except Exception as e:
             status, etype, code = error_status(e)
             return self._error(status, str(e), etype, code)
@@ -373,9 +399,10 @@ class Handler(BaseHTTPRequestHandler):
                     send({"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
                           "choices": [], "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}})
                 ttft = f"{first_token_at - t0:.1f}s" if first_token_at else "n/a"
-                log.info("stream %s %.1fs first-text=%s in=%d streamed=%d final=%d chars finish=%s %s model=%s",
-                         cid, time.time() - t0, ttft, len(prompt), len(client_text), len(fut.result()), reason,
-                         "resumed" if getattr(fut, "resumed", False) else "new-chat", getattr(fut, "model", None))
+                log.info(":%d stream %s %.1fs first-text=%s in=%d streamed=%d final=%d chars finish=%s %s model=%s",
+                         self.port, cid, time.time() - t0, ttft, len(prompt), len(client_text), len(fut.result()),
+                         reason, "resumed" if getattr(fut, "resumed", False) else "new-chat",
+                         getattr(fut, "model", None))
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 raise
             except Exception as exc:  # anything else: tell the client, then end the stream properly
@@ -383,7 +410,7 @@ class Handler(BaseHTTPRequestHandler):
                 if status == 500:
                     log.exception("stream %s: unexpected error", cid)
                 else:
-                    log.warning("stream %s failed: %d %s: %s", cid, status, code, exc)
+                    log.warning(":%d stream %s failed: %d %s: %s", self.port, cid, status, code, exc)
                 send({"error": {"message": str(exc), "type": etype, "param": None, "code": code}})
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
@@ -391,7 +418,30 @@ class Handler(BaseHTTPRequestHandler):
             log.warning("client disconnected during %s (Copilot will finish the reply in the background)", cid)
 
     def log_message(self, fmt, *args):
-        log.info("%s - %s", self.client_address[0], fmt % args)
+        log.info(":%d %s - %s", self.port, self.client_address[0], fmt % args)
+
+
+def make_server(port, session=None, store=None, serve=True, host=None):
+    """An API server on `port` for one session. Raises OSError if the port is taken.
+    serve=False binds the port without answering yet (set .RequestHandlerClass.session, then serve())."""
+    handler = type(f"Handler{port}", (Handler,), {"session": session, "store": store})
+    httpd = ThreadingHTTPServer((host or config.HOST, port), handler)
+    if serve:
+        serve_in_background(httpd)
+    return httpd
+
+
+def serve_in_background(httpd):
+    threading.Thread(target=httpd.serve_forever, daemon=True,
+                     name=f"http-{httpd.server_address[1]}").start()
+
+
+def setup_logging():
+    os.makedirs(config.LOG_DIR, exist_ok=True)
+    handlers = [logging.FileHandler(os.path.join(config.LOG_DIR, "server.log"), encoding="utf-8")]
+    if sys.stderr:                      # no console under pythonw (start_manager.cmd)
+        handlers.append(logging.StreamHandler())
+    logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, handlers=handlers)
 
 
 def main():
@@ -399,26 +449,24 @@ def main():
     ap.add_argument("--show", action="store_true", help="show the browser window")
     ap.add_argument("--port", type=int, default=config.PORT)
     args = ap.parse_args()
+    setup_logging()
+    if config.KILL_ON_EXIT:
+        procs.kill_children_on_exit()
 
-    os.makedirs(config.LOG_DIR, exist_ok=True)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-                        handlers=[logging.StreamHandler(),
-                                  logging.FileHandler(os.path.join(config.LOG_DIR, "server.log"), encoding="utf-8")])
-
-    Handler.store = ConversationStore() if config.RESUME_CONVERSATIONS else None
-    Handler.session = CopilotSession(show_window=args.show)
-    server = ThreadingHTTPServer((config.HOST, args.port), Handler)
+    store = ConversationStore() if config.RESUME_CONVERSATIONS else None
+    session = CopilotSession(show_window=args.show, name=str(args.port))
+    httpd = make_server(args.port, session, store, serve=False)
     log.info("OpenAI-compatible API at http://%s:%d/v1  (resume chats: %s)", config.HOST, args.port,
-             "on" if Handler.store is not None else "off")
+             "on" if store is not None else "off")
     try:
-        server.serve_forever()
+        httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        server.server_close()
-        Handler.session.close()
-        if Handler.store is not None:
-            Handler.store.close()
+        httpd.server_close()
+        session.close()
+        if store is not None:
+            store.close()
 
 
 if __name__ == "__main__":

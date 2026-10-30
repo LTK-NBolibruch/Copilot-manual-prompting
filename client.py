@@ -3,6 +3,7 @@
 Lists the models in Copilot's model picker, then holds a two-turn
 conversation. The second request sends the first reply back in `messages`,
 so the server continues the same Copilot chat instead of starting a new one.
+With manager.py, change the port to use another session.
 """
 from openai import OpenAI
 

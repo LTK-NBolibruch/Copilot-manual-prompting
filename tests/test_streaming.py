@@ -17,7 +17,6 @@ from copilot import BlockStreamer, CopilotSession, DeltaTracker, extend, remaind
 needs_md = pytest.mark.skipif(copilot._to_md is None, reason="markdownify not installed")
 
 
-# ---------------------------------------------------------------- unit: alignment
 def test_extend_exact_and_formatting_insensitive():
     assert extend("", "abc") == "abc"
     assert extend("Hello", "Hello world") == " world"
@@ -36,7 +35,6 @@ def test_remainder_unalignable_returns_none():
     assert remainder("completely different text here", "nothing in common at all, really") is None
 
 
-# ---------------------------------------------------------------- unit: trackers
 def test_tracker_appends():
     t = DeltaTracker()
     assert t.feed("") == ""
@@ -73,7 +71,6 @@ def test_block_streamer_pauses_when_sent_text_rewritten():
     assert b.diverged
 
 
-# ---------------------------------------------------------------- fake page
 class FakeLocator:
     def __init__(self, page):
         self.page = page
@@ -83,13 +80,6 @@ class FakeLocator:
 
 
 class FakePage:
-    """Each evaluate() returns the next snapshot; the last one repeats.
-
-    A snapshot is a list of HTML blocks, a plain string, or
-    {"reasoning": str, "answer": str or [blocks]}.
-    generating_until: number of polls during which the Stop button is visible.
-    """
-
     def __init__(self, snapshots, generating_until=0):
         self.snapshots, self.i = snapshots, 0
         self.generating_until = generating_until
@@ -113,8 +103,6 @@ class FakePage:
 
 
 class EndlessPage(FakePage):
-    """Reply that never stops changing."""
-
     def __init__(self):
         super().__init__([""], generating_until=10 ** 9)
 
@@ -126,11 +114,8 @@ class EndlessPage(FakePage):
 
 
 def make_session(markdown=False):
-    s = CopilotSession.__new__(CopilotSession)  # skip browser start
-    s.markdown = markdown
-    s._md_cache = {}
-    s._warned_no_stop = False
-    s._prompt_norm = ""
+    s = CopilotSession.__new__(CopilotSession)
+    s.markdown, s._md_cache, s._warned_no_stop, s._prompt_norm, s.name = markdown, {}, False, "", "t"
     return s
 
 
@@ -161,7 +146,6 @@ def run(page, mode, monkeypatch, markdown=False):
     return got, result, fut
 
 
-# ---------------------------------------------------------------- markdown mode
 GROWING_REPLY = [
     ["<h2>Head"],
     ["<h2>Headway</h2>", "<p>Time between **tr"],
@@ -183,7 +167,7 @@ def test_markdown_stream_matches_final(monkeypatch):
     assert streamed == result == fut.streamed_text
     assert result.startswith("## Headway\n\nTime between **trains**.")
     assert "| T0 | 120 s |" in result and result.endswith("Done.")
-    assert "\\*" not in streamed            # half-rendered (escaped) ** never sent
+    assert "\\*" not in streamed
 
 
 @needs_md
@@ -232,7 +216,6 @@ def test_markdown_mode_falls_back_to_text_without_markdownify(monkeypatch):
     assert "".join(got) == result == "abc"
 
 
-# ---------------------------------------------------------------- completion detection
 def test_waits_for_stop_button(monkeypatch):
     snaps = ["Part one"] * 30 + ["Part one and two"]
     got, result, _ = run(FakePage(snaps, generating_until=31), "text", monkeypatch)
@@ -262,7 +245,6 @@ def test_answer_plain_recorded(monkeypatch):
     assert fut.answer_plain == "The answer."
 
 
-# ---------------------------------------------------------------- text mode
 def test_text_mode_streams_deltas(monkeypatch):
     page = FakePage(["", "The", "The quick", "The quick brown", "The quick brown fox."], generating_until=5)
     got, result, fut = run(page, "text", monkeypatch)
@@ -290,13 +272,12 @@ def test_callback_errors_dont_break_worker(monkeypatch):
     assert make_session()._wait_for_completion(FakePage(["x", "xy"]), new_future(), bad) == "xy"
 
 
-# ---------------------------------------------------------------- reasoning
 REASONING_REPLY = [
     {"reasoning": "Thinking..."},
     {"reasoning": "Thinking... The user asks about headway."},
     {"reasoning": "Thinking... The user asks about headway. Check T0 and T1."},
     {"reasoning": "Thinking... The user asks about headway. Check T0 and T1.", "answer": "Headway is"},
-    {"reasoning": "", "answer": "Headway is the time between trains."},   # panel collapsed
+    {"reasoning": "", "answer": "Headway is the time between trains."},
 ]
 TAGGED = ("<think>\nThinking... The user asks about headway. Check T0 and T1.\n</think>\n\n"
           "Headway is the time between trains.")
@@ -307,7 +288,7 @@ def test_reasoning_streamed_in_think_tags_before_answer(monkeypatch, mode):
     got, result, fut = run(FakePage(REASONING_REPLY, generating_until=5), mode, monkeypatch)
     streamed = "".join(got)
     assert streamed == result == fut.streamed_text == TAGGED
-    assert got[0] == "<think>\n" and got[1] == "Thinking..."     # reasoning streams live
+    assert got[0] == "<think>\n" and got[1] == "Thinking..."
     assert fut.answer_plain == "Headway is the time between trains."
 
 

@@ -7,11 +7,15 @@
   python ask.py --stream "..."     # print the reply as Copilot writes it
   python ask.py --models           # list the models in Copilot's model picker
   python ask.py --model "Think deeper" "..."
+
+Stop server.py / manager.py first: they use the same browser profile.
 """
 import argparse
 import logging
 import sys
 
+import config
+import procs
 from copilot import CopilotSession
 from models import model_id, resolve
 
@@ -43,6 +47,8 @@ def main():
     ap.add_argument("--model", help="model name or id to select first (default: keep the current selection)")
     args = ap.parse_args()
     logging.basicConfig(level=logging.WARNING)
+    if config.KILL_ON_EXIT:
+        procs.kill_children_on_exit()
 
     with CopilotSession(show_window=args.show, markdown=not args.plain,
                         discover_models=bool(args.models or args.model)) as s:

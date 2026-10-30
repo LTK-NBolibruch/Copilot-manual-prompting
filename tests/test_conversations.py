@@ -22,7 +22,6 @@ def tags(monkeypatch):
     monkeypatch.setattr(config, "POLL_INTERVAL", 0.001)
 
 
-# ---------------------------------------------------------------- keys
 def test_conversation_url():
     assert conversation_url(URL) == URL
     assert conversation_url(URL + "?foo=1#x") == URL
@@ -46,7 +45,6 @@ def test_history_key_robust_but_specific():
     assert history_key([{"role": "user", "content": "x"}]) != history_key([{"role": "assistant", "content": "x"}])
 
 
-# ---------------------------------------------------------------- store
 def test_store_put_get_update(tmp_path):
     s = ConversationStore(str(tmp_path / "c.db"))
     assert s.get("k") is None
@@ -56,8 +54,15 @@ def test_store_put_get_update(tmp_path):
     assert s.get("k")["turns"] == 2 and s.get("k")["model"] is None and len(s) == 1
 
 
+def test_store_claim_release(tmp_path):
+    s = ConversationStore(str(tmp_path / "c.db"))
+    assert s.claim(URL) is True
+    assert s.claim(URL) is False          # a second request can't take the same chat
+    s.release(URL)
+    assert s.claim(URL) is True
+
+
 def test_store_upgrades_old_database(tmp_path):
-    """A conversations.db created by v8-v10 has no model column."""
     path = str(tmp_path / "old.db")
     db = sqlite3.connect(path)
     db.execute("""CREATE TABLE conversations (key TEXT PRIMARY KEY, chat_url TEXT NOT NULL, turns INTEGER NOT NULL,
@@ -84,7 +89,6 @@ def test_store_persists_and_prunes(tmp_path, monkeypatch):
     assert s2.get("new") and s2.get("old") is None
 
 
-# ---------------------------------------------------------------- reopening a chat
 class NavPage:
     def __init__(self, last_reply, landed=None, load_error=None):
         self.last_reply, self.landed, self.load_error = last_reply, landed, load_error
@@ -106,7 +110,7 @@ class NavPage:
 
 def session():
     s = CopilotSession.__new__(CopilotSession)
-    s.show_window, s._prompt_norm = False, ""
+    s.show_window, s._prompt_norm, s.name = False, "", "t"
     return s
 
 

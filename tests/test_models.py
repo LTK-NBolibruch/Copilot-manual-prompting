@@ -1,7 +1,5 @@
-"""Model list and model selection: name/id mapping, reading the picker (including sub-menus),
-selecting a model. The picker is simulated (no browser), using the menu structure from the
-real page: a main menu, and a sub-menu whose options are role="menuitemradio" with
-data-testid="gptSubMenuModelTrigger-OpenAI" and a checkmark icon data-testid="checkmark-<key>"."""
+"""Model list and model selection, including sub-menus. The picker is simulated (no browser),
+using the menu structure from the real page."""
 import os
 import re
 import sys
@@ -23,7 +21,6 @@ def defaults(monkeypatch):
     monkeypatch.setattr(config, "MODELS", "")
 
 
-# ---------------------------------------------------------------- names and ids
 def test_ids():
     assert slug("Think deeper") == "think-deeper"
     assert slug("GPT-5.6 Sol Quick response") == "gpt-5-6-sol-quick-response"
@@ -56,7 +53,6 @@ def test_resolve():
     assert resolve("gpt-4o", names, keys) == (None, False)
 
 
-# ---------------------------------------------------------------- simulated picker
 MAIN = [{"name": "Auto"}, {"name": "Quick response"}, {"name": "Think deeper"},
         {"name": "GPT-5.6 Sol", "submenu": True}]
 SUB = [{"name": "GPT-5.6 Sol Quick response", "key": "Gpt_5_6_Chat"},
@@ -119,9 +115,6 @@ class Keyboard:
 
 
 class PickerPage:
-    """sub_label: what the picker button shows for a sub-menu model - "full" name or "short"
-    (the part after "GPT-5.6 Sol ")."""
-
     def __init__(self, selected="Auto", picker_works=True, selection_sticks=True, sub_opens_on="click",
                  sub_label="full", sub=SUB):
         self.selected, self.main_open, self.sub_open, self.focused = selected, False, False, None
@@ -151,8 +144,7 @@ class PickerPage:
         if script is copilot.MENU_OPEN_JS:
             return self.main_open or self.sub_open
         if script is copilot.MENU_JS:
-            which = arg[3]
-            if which == "main":
+            if arg[3] == "main":
                 if self.main_open:
                     self.menus_opened += 1
                 return self._opts(MAIN) if self.main_open else None
@@ -171,7 +163,7 @@ class PickerPage:
 
 def session():
     s = CopilotSession.__new__(CopilotSession)
-    s.show_window, s.discover_models = False, True
+    s.show_window, s.discover_models, s.name = False, True, "t"
     s._models = {"names": [], "current": None, "fetched": 0.0, "source": "none", "paths": {}, "keys": {}}
     s._models_lock = threading.Lock()
     s._models_refresh = None
@@ -190,7 +182,7 @@ def test_refresh_reads_main_menu_and_submenu(opens_on):
     assert s.model_keys() == {"GPT-5.6 Sol Quick response": "Gpt_5_6_Chat",
                               "GPT-5.6 Sol Think deeper": "Gpt_5_6_Reasoning"}
     assert s.current_model == "Quick response"
-    assert not page.main_open and not page.sub_open            # menus closed again
+    assert not page.main_open and not page.sub_open
 
 
 def test_refresh_submenu_that_wont_open_keeps_main_models():
@@ -232,12 +224,10 @@ def test_select_submenu_model_other_open_methods(opens_on):
 
 
 def test_select_submenu_model_button_shows_short_label():
-    """The button may show only "Think deeper" for "GPT-5.6 Sol Think deeper": the menu's
-    checkmark decides, and the top-level "Think deeper" is not mistaken for it."""
     s, page = refreshed(sub_label="short")
     s._select_model(page, "GPT-5.6 Sol Think deeper")
     assert page.selected == "GPT-5.6 Sol Think deeper"
-    s._select_model(page, "Think deeper")                    # same label, different model
+    s._select_model(page, "Think deeper")
     assert page.selected == "Think deeper"
     s._select_model(page, "GPT-5.6 Sol Think deeper")
     assert page.selected == "GPT-5.6 Sol Think deeper"
@@ -251,7 +241,6 @@ def test_select_already_selected_does_not_open_menu():
 
 
 def test_select_without_known_path_searches_submenus():
-    """Model names from COPILOT_MODELS: no recorded path, so all sub-menus are searched."""
     s, page = session(), PickerPage()
     s._select_model(page, "GPT-5.6 Sol Think deeper")
     assert page.selected == "GPT-5.6 Sol Think deeper"

@@ -1,10 +1,4 @@
-"""Which page element is the new reply? Runs the browser-side helpers (PICK_JS) in node.
-
-Scenarios behind 'mangled replies / final reply never sent':
-  * your own message bubble matches REPLY_SEL and appears before Copilot replies
-  * a resumed chat lazily loads older history after the prompt is sent
-  * Copilot re-renders an old reply while the new one is being written
-"""
+"""Which page element is the new reply? Runs the browser-side helpers (PICK_JS) in node."""
 import json
 import os
 import shutil
@@ -22,7 +16,6 @@ pytestmark = pytest.mark.skipif(NODE is None, reason="node not installed")
 
 
 def js(expr, **values):
-    """Evaluate a JS expression with PICK_JS loaded and `values` bound as constants."""
     binds = "".join(f"const {k} = {json.dumps(v)};\n" for k, v in values.items())
     out = subprocess.run([NODE, "-e", PICK_JS + binds + f"process.stdout.write(JSON.stringify({expr}));"],
                          capture_output=True, text=True, check=True)

@@ -29,8 +29,8 @@ REASONING_SEL     = _env("COPILOT_REASONING_SEL",
 
 # ---------------------------------------------------------------------------
 # Models
-# /v1/models lists the models in Copilot's model picker, read from the web UI.
-# A request's "model" selects that model in the picker before the prompt is sent.
+# /v1/models lists the models in Copilot's model picker (including its sub-menus), read
+# from the web UI. A request's "model" selects that model in the picker before the prompt is sent.
 #   "m365-copilot"            -> keep whatever is currently selected
 #   "m365-copilot-<name>"     -> select <name>, e.g. m365-copilot-auto
 #   "<name>"                  -> also accepted, e.g. "Auto" (case-insensitive)
@@ -70,6 +70,30 @@ LOG_CONVERSATIONS    = _flag("COPILOT_LOG_CONVERSATIONS", "0")                # 
 # 1 = save every reply's HTML, the markdown produced from it and the page text to
 #     logs/replies/<time>.{html,md,txt}, to diagnose formatting problems.
 DEBUG_REPLIES = _flag("COPILOT_DEBUG_REPLIES", "0")
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Browser for manager.py
+# manager.py starts a normal Edge (not one launched by Playwright, which Copilot only lets load
+# one chat at a time) with remote debugging on a local port, and each session attaches to it.
+EDGE_PATH   = _env("COPILOT_EDGE_PATH", "")           # msedge.exe; found automatically if empty
+# How the browser is kept out of sight when the manager runs without --show:
+#   offscreen - a normal window placed off-screen; "Show browser" in the manager brings it back (default)
+#   headless  - no window at all; you can't sign in from the manager in this mode
+EDGE_HIDDEN = _env("COPILOT_EDGE_HIDDEN", "offscreen")
+BROWSER_START_TIMEOUT = _env("COPILOT_BROWSER_START_TIMEOUT", 30, int)   # Edge opening its debugging port
+SESSION_START_TIMEOUT = _env("COPILOT_SESSION_START_TIMEOUT", 60, int)   # a session's tab opening
+STOP_TIMEOUT          = _env("COPILOT_STOP_TIMEOUT", 60, int)            # switch off: wait this long for a
+                                                                         # reply in progress, then abort it
+# Leftover processes. Before starting Edge, the manager looks for Edge processes already using the
+# profile (e.g. left over from a crash or Ctrl+C) and orphaned Playwright drivers:
+#   ask    - list them in the window and wait for you to click "End them and start" (default)
+#   end    - end them automatically, then start
+#   ignore - start anyway (Edge will probably close right away: "closed right after starting")
+STALE_EDGE           = _env("COPILOT_STALE_EDGE", "ask")
+PROCESS_SCAN_SECONDS = _env("COPILOT_PROCESS_SCAN_SECONDS", 10, float)   # how often the window re-checks
+# Windows: end Edge and the Playwright drivers when Python exits, even if it crashes or is killed.
+KILL_ON_EXIT         = _flag("COPILOT_KILL_ON_EXIT", "1")
 # ---------------------------------------------------------------------------
 
 CHAT_URL        = _env("COPILOT_CHAT_URL", "https://m365.cloud.microsoft/chat/")
@@ -118,6 +142,6 @@ STREAM_POLL_INTERVAL = _env("COPILOT_STREAM_POLL_INTERVAL", 0.3, float)  # while
 
 # Server (local only)
 HOST     = _env("COPILOT_HOST", "127.0.0.1")
-PORT     = _env("COPILOT_PORT", 5000, int)
+PORT     = _env("COPILOT_PORT", 5000, int)       # first session's port; manager.py's Add uses the next ones
 LOG_DIR  = _env("COPILOT_LOG_DIR", "./logs")
 MAX_PROMPT_CHARS = _env("COPILOT_MAX_PROMPT_CHARS", 200000, int)  # server-side sanity limit only

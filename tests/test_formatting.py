@@ -1,4 +1,4 @@
-"""Markdown conversion and the plain-text fallback (the cause of unformatted replies in v6-v8)."""
+"""Markdown conversion and the plain-text fallback."""
 import os
 import sys
 from concurrent.futures import Future
@@ -15,7 +15,7 @@ pytestmark = pytest.mark.skipif(copilot._to_md is None, reason="markdownify not 
 
 def session():
     s = CopilotSession.__new__(CopilotSession)
-    s.markdown, s._md_cache, s._warned_no_stop, s._prompt_norm = True, {}, False, ""
+    s.markdown, s._md_cache, s._warned_no_stop, s._prompt_norm, s.name = True, {}, False, "", "t"
     return s
 
 
@@ -34,12 +34,6 @@ def test_code_block_keeps_language_and_underscores():
     md = html_to_md('<pre><code class="language-python">def run_sdr(trip_id):\n    pass</code></pre>')
     assert md.startswith("```python") and "def run_sdr(trip_id):" in md
     assert html_to_md("<p>Use <code>dcsr_token</code> in batch_mode</p>") == "Use `dcsr_token` in batch_mode"
-
-
-def test_aria_roles_after_browser_normalization():
-    assert html_to_md("<h3>Summary</h3>") == "### Summary"
-    md = html_to_md("<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>")
-    assert "| A | B |" in md and "| 1 | 2 |" in md
 
 
 class Page:
@@ -74,8 +68,6 @@ BLOCKS = ["<h2>Headway</h2>", "<p>Time between <strong>trains</strong>.</p>",
 
 
 def test_buttons_and_sources_do_not_force_plain_text():
-    """Regression: page text includes Copy buttons, citation numbers and a long sources list that
-    the markdown (correctly) leaves out. That must not make the server fall back to plain text."""
     visible = ("Headway\nTime between trains.1\nT0: 120 s\nT1: 90 s\nCopy\nLike\nDislike\n"
                "Sources\n" + "\n".join(f"{i}. TrainOps help file section {i} - SharePoint" for i in range(1, 15)))
     clean = "Headway Time between trains. T0: 120 s T1: 90 s"

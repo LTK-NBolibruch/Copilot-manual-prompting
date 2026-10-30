@@ -1,11 +1,13 @@
 # Copilot Local: OpenAI-compatible API
 
-`server.py` gives you a **local, OpenAI-compatible Chat Completions endpoint**. Behind it, Playwright drives Microsoft 365 Copilot Chat in Edge, signed in with your saved session.
+`server.py` gives you a **local, OpenAI-compatible Chat Completions endpoint**. Behind it, Playwright drives Microsoft 365 Copilot Chat in Edge, signed in with your saved session. `manager.py` runs **several endpoints at once**, one browser tab each, from a small window.
 
-There's no authentication or token handling: the server listens on `127.0.0.1` only, and any `api_key` a client sends is ignored.
+There's no authentication or token handling: endpoints listen on `127.0.0.1` only, and any `api_key` a client sends is ignored.
 
 ```
-OpenAI client ──▶ http://127.0.0.1:5000/v1 ──queue──▶ one Edge session ──▶ Copilot chat (new or resumed)
+OpenAI client ──▶ http://127.0.0.1:5000/v1 ──▶ Edge tab 1 ─┐
+OpenAI client ──▶ http://127.0.0.1:5001/v1 ──▶ Edge tab 2 ─┼─▶ Copilot chats (new or resumed)
+                                          ...              ┘   one browser, one profile, one sign-in
 ```
 
 ## Setup
@@ -13,14 +15,110 @@ OpenAI client ──▶ http://127.0.0.1:5000/v1 ──queue──▶ one Edge s
 ```powershell
 pip install -r requirements.txt        # includes markdownify, needed for formatted replies
 python ask.py --show "Reply with OK"   # one-time sign-in (saved in .\playwright_profile)
-python server.py                       # http://127.0.0.1:5000/v1
+
+python server.py                       # one endpoint:   http://127.0.0.1:5000/v1
+python manager.py                      # or: a window for several endpoints (5000, 5001, ...)
 ```
+
+Only one of `server.py`, `manager.py` and `ask.py` can run at a time, because they share the browser profile.
+
+## Several sessions at once (`manager.py`)
+
+```powershell
+python manager.py            # browser kept off-screen ("Show browser" brings it back)
+python manager.py --show     # browser visible: one window, one tab per session
+start_manager.cmd            # the same, without a console window
+```
+
+**The manager uses a normal Edge.** It starts Edge itself, as an ordinary process with remote debugging on a local port, using the saved profile (`playwright_profile`). Each session then attaches to that Edge in its own tab. In an Edge launched *by Playwright*, Copilot only loads one chat at a time, so extra tabs never got past loading. A normal Edge doesn't have that limit. `server.py` and `ask.py` still use a Playwright-launched Edge, which is fine for a single session.
+
+The window lists one row per session: name, port, endpoint URL (selectable, so you can copy it), an on/off switch, a status and a **Remove** button.
+
+| Control | What it does |
+|---|---|
+| **Add** | Adds a session on the next port (5000, 5001, 5002, …) and switches it on |
+| **Switch on** | Opens a new tab in the browser and starts answering on that port |
+| **Switch off** | Stops taking requests on that port, lets a reply in progress finish (up to `COPILOT_STOP_TIMEOUT`, 60 s, then aborts it) and closes the tab |
+| **Switch, while "Starting…"** | Cancels the start and frees the port |
+| **Remove** | Stops the session **right away**, aborting a reply in progress or a start, and removes the row |
+| **Show browser / Hide browser** | Moves the Edge window on- or off-screen, for example to sign in. Not available with `COPILOT_EDGE_HIDDEN=headless` |
+| **Processes…** | Lists the browser processes using the profile, and lets you end leftovers (see below) |
+| **Retry** | Appears when the browser couldn't start. Starts it again once you've fixed the problem |
+| **Closing the window** | Switches every session off (replies in progress finish first), closes Edge, and waits until its processes are gone |
+| **Ctrl+C in the console** | Stops every session immediately, then closes Edge |
+
+### Leftover browser processes
+
+Stale Edge processes, left behind by a crash, Ctrl+C or a killed Python, keep using the profile. A new Edge on that profile then can't start properly, and tabs fail to load. The manager deals with them in three ways.
+
+**1. They're found before Edge starts.** Every Edge process names its profile on its command line (`--user-data-dir=…`), so the manager can find each one using `playwright_profile`, whoever started it. If there are any, Edge isn't started yet. A yellow bar explains what was found, with an **End them and start** button, and sessions show `Waiting for the browser`. If you end them another way, for example in Task Manager, the manager notices within a couple of seconds and starts by itself.
+
+**2. They're watched while it runs.** The manager re-checks every `COPILOT_PROCESS_SCAN_SECONDS` (10 s).
+- **The top line** shows this manager's Edge, for example `Browser: ready (off-screen) · Edge PID 4120, 17 processes`.
+- **The yellow bar** reappears with an **End them** button if leftovers or orphaned Playwright drivers turn up.
+- **Processes…** lists everything it found:
+
+| What | Meaning | Can be ended here |
+|---|---|---|
+| Edge (this manager) | The Edge this manager started, with its process count | No: use **Retry** to restart it |
+| Edge left over from an earlier run | The program that started it is gone | Yes |
+| Edge used by another program | The program that started it is still running, usually `server.py` or `ask.py` (the *Started by* column names it) | Yes, which closes that program's browser |
+| Orphaned Playwright driver | A `node.exe` Playwright driver whose Python is gone (the `EPIPE` crash after Ctrl+C leaves these) | Yes |
+
+Only processes using **this app's profile** are ever listed or ended, never your everyday Edge. The list is re-checked just before ending anything, so a process ID that Windows has reused since is never ended.
+
+**3. Windows ends them automatically.** At startup, `manager.py`, `server.py` and `ask.py` put themselves in a Windows *job object*. Windows then ends everything they started (Edge and the Playwright drivers) when the Python process exits, even if it crashes or is ended from Task Manager. Turn this off with `COPILOT_KILL_ON_EXIT=0`. If Windows refuses, a warning is logged and the leftovers are caught at the next start instead.
+
+**Per-tab process IDs aren't shown.** Edge can share one renderer process between tabs on the same site, so a session's tab doesn't reliably map to its own process.
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `COPILOT_STALE_EDGE` | `ask` | Leftovers found before starting: `ask` (yellow bar, wait for you), `end` (end them automatically), `ignore` (start anyway) |
+| `COPILOT_PROCESS_SCAN_SECONDS` | `10` | How often the window re-checks the processes |
+| `COPILOT_KILL_ON_EXIT` | `1` | Windows: end Edge and the drivers when Python exits |
+
+Install **psutil** (it's in `requirements.txt`) for fast process listing. Without it, the manager asks PowerShell, which takes about a second per check.
+
+### Time limits
+
+Nothing waits forever:
+
+| Step | Limit | Setting |
+|---|---|---|
+| Edge opening its debugging port | 30 s | `COPILOT_BROWSER_START_TIMEOUT` |
+| A session's tab opening | 60 s | `COPILOT_SESSION_START_TIMEOUT` |
+| Switching off with a reply in progress | 60 s, then the reply is aborted | `COPILOT_STOP_TIMEOUT` |
+
+A session that hits a limit shows an error in its row and can be switched on again. Waiting for you to end leftover processes has no limit.
+
+### Signing in
+
+- **The top line says when you need to.** If the browser isn't signed in, it shows `Browser: not signed in - click Show browser and sign in`, and session rows show `On - not signed in`.
+- **How to sign in.** Click **Show browser**, then sign in in the Copilot tab. The sign-in is saved to the profile, and you can click **Hide browser** afterwards.
+- **Requests during sign-in.** While the window is shown, a request that hits the sign-in page waits up to `COPILOT_LOGIN_TIMEOUT` (5 min) for you to finish, instead of failing straight away.
+
+### Other details
+
+- **Concurrency.** Each session handles one request at a time, and sessions run in parallel. Point different clients, or different conversations, at different ports. Two requests sent to the same port queue up one after the other.
+- **Conversations are shared.** All sessions use one `conversations.db`, so a conversation started on 5000 can continue on 5001. Two sessions never continue the **same** Copilot chat at the same time: if a second request arrives for a chat that's busy, it starts a new chat instead.
+- **Status messages.**
+  - `Starting… 12s`: the session is opening its tab. Click the switch to cancel.
+  - `On (2 queued)`: requests waiting for that session.
+  - `Error: …`: for example `port 5001 unavailable`, if another program has the port. Switch it on again once it's fixed.
+- **The first port** comes from `COPILOT_PORT` (default 5000). Sessions aren't remembered between runs; the window always starts with one session.
+- **Finding Edge.** The manager looks for `msedge.exe` in the usual install folders. Set `COPILOT_EDGE_PATH` if it's somewhere else.
+- **Off-screen window.** The browser is a normal window placed off-screen (`COPILOT_EDGE_HIDDEN=offscreen`, the default). `headless` hides it completely, but then you can't sign in from the manager.
+- **Logs.** All sessions write to `logs/server.log`. Each line shows its session, for example `[copilot-5001]` or `:5001`. Ending processes is logged too, with each PID.
+
+**Unknowns to watch:**
+- **Copilot throttling.** All tabs use your one Microsoft 365 account. I don't know whether Copilot throttles several chats at once for one user, so start with two sessions and watch for errors or slow replies.
+- **Model selection across tabs.** If Copilot saves the model picker's choice per user, a session switching models could affect what another tab shows as selected. Each request selects its model just before sending, which should cover this, but it's untested.
 
 ## Use from any OpenAI client
 
 | Setting | Value |
 |---|---|
-| Base URL | `http://127.0.0.1:5000/v1` (**http**, not https) |
+| Base URL | `http://127.0.0.1:5000/v1` (**http**, not https; another port for another session) |
 | API key | anything (e.g. `local`); some clients refuse an empty key |
 | Model | `m365-copilot` (current selection) or one from `/v1/models` |
 
@@ -48,13 +146,13 @@ for chunk in client.chat.completions.create(model="m365-copilot", stream=True,
 | POST | `/v1/chat/completions` (also `/v1`) | Supports `stream: true/false` and `stream_options.include_usage` |
 | GET | `/v1/models` | The models in Copilot's model picker (see *Models*) |
 | GET | `/v1/models/{id}` | One model |
-| GET | `/health` | Worker status, queue depth, models, current model and number of stored conversations |
+| GET | `/health` | Port, worker status, queue depth, models, current model and number of stored conversations |
 
 ## Models
 
 `/v1/models` lists the models in Copilot's **model picker**, read from the web UI.
 
-1. **Reading the list.** At startup, the server opens the picker (`#gptModeSwitcher`) and reads the option names. **Sub-menus are read too:** for an entry that opens a sub-menu (such as `GPT-5.6 Sol`), the server opens it and adds its models (for example `GPT-5.6 Sol Quick response` and `GPT-5.6 Sol Think deeper`). It then closes the menus. The list is re-read every `COPILOT_MODELS_REFRESH_MINUTES` (60), in the background.
+1. **Reading the list.** At startup, the server opens the picker (`#gptModeSwitcher`) and reads the option names. **Sub-menus are read too:** for an entry that opens a sub-menu (such as `GPT-5.6 Sol`), the server opens it and adds its models. It then closes the menus. The list is re-read every `COPILOT_MODELS_REFRESH_MINUTES` (60), in the background.
 2. **The IDs.** Each model gets an ID made from its name. `m365-copilot` on its own means "whatever is currently selected":
 
    ```
@@ -137,6 +235,7 @@ OpenAI clients send the whole conversation with every request. Instead of starti
 | You regenerate or edit an earlier message | No match, or the chat has moved on, so a new chat starts |
 | The system prompt changes | No match, so a new chat starts |
 | The request asks for a different model than the chat used | A new chat starts |
+| Another session is continuing the same chat right now | A new chat starts |
 | The chat was deleted or won't load | The check fails, so a new chat starts and the next turn resumes that one |
 | The chat reaches `COPILOT_MAX_TURNS` (30) | A new chat starts |
 | The sign-in has expired | 503 `login_required`, as for any request |
@@ -250,13 +349,13 @@ python ask.py --models                 # list the models in the picker
 python ask.py --model "Think deeper" "Compare T0 and T1 batch mode"
 ```
 
-`ask.py` always starts a new chat for each prompt. Stop the server before using it, because both use the same browser profile.
+`ask.py` always starts a new chat for each prompt. Stop `server.py` / `manager.py` before using it, because they share the browser profile.
 
 ## Notes
 
-- **One prompt at a time.** Concurrent requests queue up behind each other, and so does re-reading the model list.
+- **One prompt at a time per session.** Within a session, concurrent requests queue up behind each other, and so does re-reading the model list. Use `manager.py` for parallel requests.
 - **Client timeouts.** Set the client timeout above `COPILOT_REPLY_TIMEOUT` (600 s). The OpenAI SDK's default is also 600 s, so raise it or lower the server limit.
 - **Logs.** `logs/server.log` records each request, whether it resumed a chat, which model answered, and how each reply ended (`stable`, `stuck` or `timeout`). For streamed replies it also records how long until the first text arrived and how much was streamed versus the final reply.
-- **Re-sign-in.** Stop the server, run `python ask.py --show "Reply with OK"`, then start it again.
+- **Re-sign-in.** Stop the server or manager, run `python ask.py --show "Reply with OK"`, then start it again.
 - **Settings.** Selectors, timeouts, poll intervals, stream mode, reasoning tags, models, conversation resuming, debugging, port and model ID are in `config.py`, and each can be overridden with a `COPILOT_*` environment variable.
-- **Tests.** Run `pytest -q`. The browser is mocked; reply reading, formatting, streaming, model selection and chat resuming are tested against simulated Copilot pages. The reply-picking logic runs in Node, which is skipped if `node` isn't installed. The browser-side scripts have not been tested against the real page.
+- **Tests.** Run `pytest -q`. The browser is mocked; reply reading, formatting, streaming, model selection, chat resuming, running several sessions, cancelling and removing sessions, starting Edge, and finding and ending leftover processes are tested against simulated pages and processes. The reply-picking logic runs in Node, which is skipped if `node` isn't installed. The process tests start stand-in processes and are skipped on Windows. The browser-side scripts, the real Edge, the Windows-only process code (PowerShell listing, `taskkill`, the job object) and the window have not been tested on a real machine.

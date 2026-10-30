@@ -11,6 +11,9 @@ COPILOT_LOG_CONVERSATIONS=1, which appends full text to logs/conversations.jsonl
 Normalization makes matching robust to how clients store replies: reasoning
 blocks (<THINK_TAG>...</THINK_TAG>) are removed and only letters/digits are
 kept, lower-cased, so whitespace, punctuation and markdown changes don't matter.
+
+Several sessions (manager.py) share one store. claim()/release() make sure two
+sessions never continue the same Copilot chat at the same time.
 """
 import hashlib
 import json
@@ -70,6 +73,7 @@ class ConversationStore:
     def __init__(self, path=None):
         self.path = path or config.CONVERSATION_DB
         self.lock = threading.Lock()
+        self._busy: set[str] = set()       # chat URLs being continued right now
         self.db = sqlite3.connect(self.path, check_same_thread=False)
         self.db.execute("""CREATE TABLE IF NOT EXISTS conversations (
                              key TEXT PRIMARY KEY, chat_url TEXT NOT NULL, turns INTEGER NOT NULL,
@@ -99,6 +103,18 @@ class ConversationStore:
                                reply_hash=excluded.reply_hash, last_used=excluded.last_used, model=excluded.model""",
                             (key, chat_url, turns, reply_hash, now, now, model))
             self.db.commit()
+
+    def claim(self, chat_url) -> bool:
+        """Reserve a chat for one request. False if another request is already continuing it."""
+        with self.lock:
+            if chat_url in self._busy:
+                return False
+            self._busy.add(chat_url)
+            return True
+
+    def release(self, chat_url):
+        with self.lock:
+            self._busy.discard(chat_url)
 
     def prune(self):
         cutoff = time.time() - config.CONVERSATION_TTL_DAYS * 86400

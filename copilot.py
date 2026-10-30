@@ -1,7 +1,17 @@
 """Browser automation for Microsoft 365 Copilot Chat.
 
-CopilotSession keeps ONE Edge instance open and serves prompts one at a time
-from a dedicated worker thread (Playwright's sync API is thread-bound).
+CopilotSession serves prompts one at a time from a dedicated worker thread
+(Playwright's sync API is thread-bound). It either launches its own Edge
+(single-server use: server.py, ask.py), or - given cdp_url - opens its own TAB
+in a browser started by BrowserHost, so several sessions can run at once with
+one browser profile and one sign-in (manager.py).
+
+BrowserHost starts a NORMAL Edge process (not one launched by Playwright) with
+remote debugging on a local port; sessions attach to it. Copilot only loads one
+chat at a time in a Playwright-launched Edge, but several in a normal one.
+
+Sessions can be cancelled while starting (cancel=Event) and aborted at any
+time (abort()): waits inside the worker check for that at least once a second.
 
 Models: model_names() lists the models in Copilot's model picker, including
 models inside its sub-menus (read from the web UI at startup and every
@@ -18,9 +28,7 @@ an earlier reply), a new chat is started with the full prompt instead.
 Finding the reply: before a prompt is sent, every reply and reasoning element
 already on the page is marked. Afterwards, only unmarked elements that come
 after the marked ones - and after your own message bubble, which is recognised
-by its text or USER_MSG_SEL - count as the new reply. (Counting elements was
-not reliable: your own message, lazily loaded chat history and re-rendered
-wrappers all change the count.)
+by its text or USER_MSG_SEL - count as the new reply.
 
 Formatting: the reply's HTML is cleaned in the browser (Copy buttons, icons,
 citation markers and reasoning removed; ARIA-role tables/lists/headings and
@@ -54,20 +62,25 @@ Future attributes set by the worker:
     answer_plain    the answer's cleaned page text (used to fingerprint the chat)
     chat_url        the Copilot conversation URL, if one was detected
     resumed         True if an existing chat was continued
-    model           the model shown in the picker when the reply finished
+    model           the model that answered (requested name, or what the picker showed)
 """
 import difflib
 import logging
 import os
 import queue
 import re
+import shutil
+import socket
+import subprocess
 import threading
 import time
+import urllib.request
 from concurrent.futures import Future
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 import config
+import procs
 from conversations import conversation_url, fingerprint, normalize
 from models import checkmark_key, option_name, picker_label
 
@@ -77,6 +90,10 @@ try:
     from markdownify import markdownify as _to_md
 except ImportError:  # optional dependency
     _to_md = None
+
+# Keep tabs that aren't in front running at full speed (several sessions = several tabs).
+BROWSER_ARGS = ["--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding"]
 
 
 class CopilotError(RuntimeError):
@@ -91,6 +108,10 @@ class LoginRequired(CopilotError):
     """The saved session has expired; sign in again with --show."""
 
 
+class SessionCancelled(CopilotError):
+    """The session was cancelled while starting, or removed."""
+
+
 LOGIN_HOSTS = ("login.microsoftonline.com", "login.live.com", "login.microsoft.com", "device.login")
 
 
@@ -100,6 +121,331 @@ def _is_login_url(url: str) -> bool:
 
 def _on_login_page(page) -> bool:
     return _is_login_url(page.url)
+
+
+def _launch_edge(pw, show_window, extra_args=()):
+    return pw.chromium.launch_persistent_context(
+        user_data_dir=config.PROFILE_DIR,
+        channel=config.BROWSER_CHANNEL,
+        headless=not show_window,
+        args=BROWSER_ARGS + list(extra_args) + (["--start-maximized"] if show_window else []),
+        no_viewport=show_window,
+    )
+
+
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def find_edge() -> str:
+    """Path of msedge.exe (config.EDGE_PATH, else the usual install locations / PATH)."""
+    if config.EDGE_PATH:
+        return config.EDGE_PATH
+    candidates = []
+    for var in ("PROGRAMFILES(X86)", "PROGRAMFILES", "LOCALAPPDATA"):
+        root = os.environ.get(var)
+        if root:
+            candidates.append(os.path.join(root, "Microsoft", "Edge", "Application", "msedge.exe"))
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    for name in ("msedge", "microsoft-edge", "microsoft-edge-stable"):
+        found = shutil.which(name)
+        if found:
+            return found
+    raise CopilotError("Could not find Microsoft Edge (msedge.exe). Set COPILOT_EDGE_PATH to its full path.")
+
+
+def edge_command(port: int, visible: bool) -> list[str]:
+    """Command line for a normal Edge with remote debugging, using the saved profile."""
+    args = [find_edge(), f"--remote-debugging-port={port}",
+            f"--user-data-dir={os.path.abspath(config.PROFILE_DIR)}",
+            "--no-first-run", "--no-default-browser-check", *BROWSER_ARGS]
+    if visible:
+        args.append("--window-size=1280,900")
+    elif config.EDGE_HIDDEN == "headless":
+        args.append("--headless=new")
+    else:
+        args += ["--window-position=-32000,-32000", "--window-size=1280,900"]
+    return args + [config.CHAT_URL]
+
+
+def wait_for_devtools(port: int, proc, timeout: float, cancel=None):
+    """Wait until Edge answers on its debugging port. Raises CopilotError with a useful message."""
+    in_use = (f"Another Edge is probably already using the profile {os.path.abspath(config.PROFILE_DIR)} "
+              f"(for example left over from a crash). End the msedge.exe processes in Task Manager, "
+              f"then click Retry.")
+    deadline = time.time() + timeout
+    while True:
+        if cancel is not None and cancel.is_set():
+            raise SessionCancelled("Browser start cancelled.")
+        rc = proc.poll()
+        if rc is not None:
+            raise CopilotError(f"Edge closed right after starting (exit code {rc}). {in_use}")
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1):
+                return
+        except Exception:
+            pass
+        if time.time() > deadline:
+            raise CopilotError(f"Edge did not open its debugging port within {timeout:.0f}s. {in_use}")
+        time.sleep(0.25)
+
+
+def _end_process(proc):
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except Exception:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True)
+        else:
+            proc.kill()
+
+
+class BrowserHost:
+    """A normal Edge (started with subprocess, NOT by Playwright) with the saved profile and remote
+    debugging on a local port. CopilotSessions attach to it with cdp_url=host.cdp_url, each in its
+    own tab. The host keeps the tab Edge opened (on Copilot) for signing in, and watches whether the
+    browser is signed in.
+
+    Before starting Edge it checks for Edge processes already using the profile (config.STALE_EDGE):
+    with "ask", it waits in .blocked until end_stale_and_start() or stop(). A background monitor
+    re-scans the processes every PROCESS_SCAN_SECONDS into .scan, for the manager window.
+
+    start() / stop() / restart(); wait_ready(); set_visible(); end_stale_and_start(); end_stale();
+    .error, .needs_sign_in, .visible, .blocked, .scan, .pid
+    """
+
+    def __init__(self, show_window=False, start=True, monitor=True):
+        self.visible = show_window
+        self.headless = False
+        self.cdp_port = None
+        self.ready = threading.Event()
+        self.error = None
+        self.needs_sign_in = False
+        self.blocked = None                 # procs.Scan while waiting for leftovers to be ended
+        self.busy = ""                      # e.g. "Ending leftover processes..."
+        self.scan = None                    # latest procs.Scan
+        self.proc = None
+        self._cmds: "queue.Queue" = queue.Queue()
+        self._thread = None
+        self._monitor_stop = threading.Event()
+        self._rescan = threading.Event()
+        if monitor:
+            threading.Thread(target=self._monitor, daemon=True, name="process-monitor").start()
+        if start:
+            self.start()
+
+    @property
+    def pid(self):
+        p = self.proc
+        return p.pid if p is not None and p.poll() is None else None
+
+    def rescan(self):
+        """Ask the monitor to re-scan now."""
+        self._rescan.set()
+
+    def _monitor(self):
+        while not self._monitor_stop.is_set():
+            self.scan = procs.scan(config.PROFILE_DIR, self.pid)
+            self._rescan.wait(config.PROCESS_SCAN_SECONDS)
+            self._rescan.clear()
+
+    def end_stale_and_start(self):
+        """While blocked: end the leftover / in-use Edge processes and start."""
+        self._cmds.put(("end_stale",))
+
+    def end_stale(self, pids=None):
+        """While running: end leftover Edge processes and orphaned drivers (or the groups whose main
+        PID is in `pids`), in the background. Never ends this manager's own Edge."""
+        def run():
+            self.busy = "Ending processes…"
+            try:
+                procs.end_groups(config.PROFILE_DIR, pids=pids, our_pid=self.pid)
+            finally:
+                self.busy = ""
+                self.rescan()
+        threading.Thread(target=run, daemon=True, name="end-processes").start()
+
+    @property
+    def cdp_url(self):
+        return f"http://127.0.0.1:{self.cdp_port}"
+
+    @property
+    def can_show(self):
+        return self.ready.is_set() and not self.error and not self.headless
+
+    def start(self):
+        self.ready.clear()
+        self.error, self.needs_sign_in = None, False
+        self.cdp_port = free_port()
+        self.headless = not self.visible and config.EDGE_HIDDEN == "headless"
+        self._cmds = queue.Queue()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="browser-host")
+        self._thread.start()
+
+    def stop(self, timeout=15, final=False):
+        if final:
+            self._monitor_stop.set()
+            self._rescan.set()
+        if self._thread is None:
+            return
+        last = self.scan
+        ours = set(last.ours.pids) if last is not None and last.ours else set()
+        if self.proc is not None:
+            ours.add(self.proc.pid)
+        self._cmds.put(("stop",))
+        self._thread.join(timeout=timeout)
+        _end_process(self.proc)
+        if self.proc is not None:           # helpers that outlive the main process
+            found = procs.scan(config.PROFILE_DIR)
+            mine = [g.pid for g in found.groups if set(g.pids) & ours]
+            if mine:
+                procs.end_groups(config.PROFILE_DIR, pids=mine, wait=5)
+            if not procs.wait_profile_free(config.PROFILE_DIR, timeout=10):
+                log.warning("Edge processes are still using the profile after stopping")
+        self.proc = None
+        self.rescan()
+
+    def restart(self):
+        self.stop()
+        self.start()
+
+    def wait_ready(self, cancel=None, timeout=None) -> None:
+        """Wait for the browser; raises its error, SessionCancelled, or CopilotError on timeout."""
+        limit = timeout if timeout is not None else config.BROWSER_START_TIMEOUT + 30
+        deadline = time.time() + limit
+        while not self.ready.wait(0.2):
+            if cancel is not None and cancel.is_set():
+                raise SessionCancelled("Cancelled while waiting for the browser.")
+            if self.blocked is not None or self.busy:   # waiting for you: no time limit
+                deadline = time.time() + limit
+            if time.time() > deadline:
+                raise CopilotError("The browser did not start in time.")
+        if self.error:
+            raise self.error
+
+    def set_visible(self, visible: bool):
+        """Move the browser window on- or off-screen (not available in headless mode)."""
+        if not self.can_show:
+            return
+        self.visible = visible
+        self._cmds.put(("window", visible))
+
+    def _check_stale(self) -> bool:
+        """Before starting Edge: deal with Edge processes already using the profile.
+        False = stop was requested while waiting."""
+        if config.STALE_EDGE == "ignore":
+            return True
+        found = procs.scan(config.PROFILE_DIR)
+        if found.error or not found.blocking:
+            return True
+        if config.STALE_EDGE != "end":
+            self.blocked = found
+            self.scan = found
+            log.warning("Not starting Edge yet: %s. End them from the manager window "
+                        "(or set COPILOT_STALE_EDGE=end to do it automatically).", found.describe())
+            while True:
+                try:
+                    cmd = self._cmds.get(timeout=2)
+                except queue.Empty:               # ended some other way (Task Manager, Processes list)?
+                    found = procs.scan(config.PROFILE_DIR)
+                    if not found.error and not found.blocking:
+                        self.blocked = None
+                        log.info("The profile is free now - starting Edge")
+                        return True
+                    self.blocked = found
+                    continue
+                if cmd[0] == "stop":
+                    self.blocked = None
+                    return False
+                if cmd[0] == "end_stale":
+                    break
+        self.blocked = None
+        self.busy = "Ending processes…"
+        try:
+            left = procs.end_groups(config.PROFILE_DIR, kinds=("leftover", "in-use", "driver"))
+        finally:
+            self.busy = ""
+            self.rescan()
+        if left:
+            raise CopilotError(f"Could not end the Edge processes using the profile (PIDs {left}). "
+                               f"End them in Task Manager, then click Retry.")
+        return True
+
+    def _run(self):
+        try:
+            if not self._check_stale():
+                return
+            self.proc = subprocess.Popen(
+                edge_command(self.cdp_port, self.visible), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))  # Ctrl+C in the console
+            wait_for_devtools(self.cdp_port, self.proc, config.BROWSER_START_TIMEOUT)  # doesn't reach Edge
+            with sync_playwright() as pw:
+                browser = pw.chromium.connect_over_cdp(self.cdp_url, timeout=config.BROWSER_START_TIMEOUT * 1000)
+                ctx = browser.contexts[0]
+                page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                time.sleep(2)                            # let a sign-in redirect happen
+                self._check_sign_in(page)
+                log.info("Browser started for sessions (Edge PID %d, %s, DevTools port %d)%s", self.proc.pid,
+                         "visible" if self.visible else ("headless" if self.headless else "off-screen"),
+                         self.cdp_port, " - NOT SIGNED IN" if self.needs_sign_in else "")
+                self.ready.set()
+                self.rescan()
+                while True:
+                    try:
+                        cmd = self._cmds.get(timeout=3)
+                    except queue.Empty:
+                        if self.proc.poll() is not None:
+                            raise CopilotError("Edge was closed. Click Retry to start it again.")
+                        if page.is_closed():             # the user closed the sign-in tab
+                            page = ctx.new_page()
+                            page.goto(config.CHAT_URL, wait_until="domcontentloaded")
+                        self._check_sign_in(page)
+                        continue
+                    if cmd[0] == "stop":
+                        try:
+                            browser.new_browser_cdp_session().send("Browser.close")
+                        except Exception:
+                            pass
+                        break
+                    if cmd[0] == "end_stale":          # not blocked any more: nothing to do
+                        continue
+                    if cmd[0] == "window":
+                        try:
+                            self._set_window(page, cmd[1])
+                        except Exception as e:
+                            log.warning("Could not %s the browser window: %s", "show" if cmd[1] else "hide", e)
+        except Exception as e:
+            self.error = e if isinstance(e, CopilotError) else CopilotError(f"Could not start Edge: {e}")
+            log.error("%s", self.error)
+        finally:
+            self.ready.set()
+            _end_process(self.proc)
+
+    def _check_sign_in(self, page):
+        url = page.url or ""
+        if _is_login_url(url):
+            self.needs_sign_in = True
+        elif "cloud.microsoft" in url:
+            self.needs_sign_in = False
+
+    def _set_window(self, page, visible):
+        cdp = page.context.new_cdp_session(page)
+        wid = cdp.send("Browser.getWindowForTarget")["windowId"]
+        cdp.send("Browser.setWindowBounds", {"windowId": wid, "bounds": {"windowState": "normal"}})
+        bounds = {"left": 80, "top": 60, "width": 1280, "height": 900} if visible else \
+            {"left": -32000, "top": -32000}
+        cdp.send("Browser.setWindowBounds", {"windowId": wid, "bounds": bounds})
+        if visible:
+            page.bring_to_front()
+            if "/chat" not in (page.url or "") and not _is_login_url(page.url or ""):
+                page.goto(config.CHAT_URL, wait_until="domcontentloaded")
 
 
 RELAY_MARK = "data-relay-old"
@@ -442,10 +788,21 @@ def configured_models() -> list[str]:
 
 
 class CopilotSession:
-    def __init__(self, show_window=False, markdown=True, discover_models=True):
+    def __init__(self, show_window=False, markdown=True, discover_models=True, cdp_url=None, name=None,
+                 cancel=None, is_visible=None, start_timeout=None):
+        """cdp_url: connect to a BrowserHost and work in a new tab of it, instead of launching Edge.
+        name: shown in log lines (thread name copilot-<name>).
+        cancel: threading.Event - setting it while the session starts makes __init__ raise SessionCancelled.
+        is_visible: callable - whether the browser window can be seen now (for signing in).
+        start_timeout: seconds to wait for the tab/browser (default config.SESSION_START_TIMEOUT)."""
         self.show_window = show_window
+        self._is_visible = is_visible
         self.markdown = markdown and _to_md is not None
         self.discover_models = discover_models
+        self.cdp_url = cdp_url
+        self.name = name or "worker"
+        self.needs_sign_in = False
+        self._aborted = False
         self._md_cache: dict[str, str] = {}
         self._warned_no_stop = False
         self._prompt_norm = ""            # your current prompt, normalized (to recognise its bubble)
@@ -462,11 +819,23 @@ class CopilotSession:
         self._q: "queue.Queue" = queue.Queue()
         self._ready = threading.Event()
         self._startup_error = None
-        self._thread = threading.Thread(target=self._run, daemon=True, name="copilot-worker")
+        self._start_timeout = start_timeout or config.SESSION_START_TIMEOUT
+        self._thread = threading.Thread(target=self._run, daemon=True, name=f"copilot-{self.name}")
         self._thread.start()
-        self._ready.wait(timeout=120)
+        deadline = time.time() + self._start_timeout + 5
+        while not self._ready.wait(0.2):
+            if cancel is not None and cancel.is_set():
+                self.abort()
+                raise SessionCancelled("Start cancelled.")
+            if time.time() > deadline:
+                self.abort()
+                raise CopilotError(f"The browser {'tab' if cdp_url else 'window'} did not open within "
+                                   f"{self._start_timeout}s.")
         if self._startup_error:
             raise self._startup_error
+        if cancel is not None and cancel.is_set():
+            self.abort()
+            raise SessionCancelled("Start cancelled.")
 
     # ---------- public API ----------
     @staticmethod
@@ -534,9 +903,26 @@ class CopilotSession:
     def alive(self) -> bool:
         return self._thread.is_alive()
 
-    def close(self):
+    def close(self, timeout=15):
+        """Finish the prompts already queued, then close the tab / browser. Returns False if that
+        didn't happen within `timeout` (use abort() then)."""
         self._q.put(None)
-        self._thread.join(timeout=15)
+        self._thread.join(timeout=timeout)
+        return not self._thread.is_alive()
+
+    def abort(self):
+        """Stop now: the prompt in progress fails within about a second, queued prompts fail, and the
+        tab / browser is closed. Doesn't wait."""
+        self._aborted = True
+        self._q.put(None)
+
+    @property
+    def aborted(self):
+        return getattr(self, "_aborted", False)
+
+    def _check_abort(self):
+        if self.aborted:
+            raise SessionCancelled("The session was stopped.")
 
     def __enter__(self):
         return self
@@ -545,31 +931,52 @@ class CopilotSession:
         self.close()
 
     # ---------- worker thread ----------
+    def _open_page(self, pw):
+        """(page, cleanup) - a tab in the BrowserHost, or a browser of our own."""
+        if self.cdp_url:
+            last = None
+            deadline = time.time() + self._start_timeout
+            while True:                 # the host's DevTools port can take a moment to answer
+                try:
+                    browser = pw.chromium.connect_over_cdp(
+                        self.cdp_url, timeout=max(1000, (deadline - time.time()) * 1000))
+                    break
+                except Exception as e:
+                    last = e
+                if self.aborted or time.time() > deadline:
+                    raise last
+                time.sleep(1)
+            if not browser.contexts:
+                raise CopilotError("The shared browser has no profile context.")
+            page = browser.contexts[0].new_page()
+            return page, page.close     # close only our tab; the host owns the browser
+        ctx = _launch_edge(pw, self.show_window)
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        return page, ctx.close
+
     def _run(self):
+        pw = None
         try:
             pw = sync_playwright().start()
-            ctx = pw.chromium.launch_persistent_context(
-                user_data_dir=config.PROFILE_DIR,
-                channel=config.BROWSER_CHANNEL,
-                headless=not self.show_window,
-                args=["--start-maximized"] if self.show_window else [],
-                no_viewport=self.show_window,
-            )
-            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            page, cleanup = self._open_page(pw)
         except Exception as e:
-            self._startup_error = CopilotError(f"Could not start browser: {e}")
+            self._startup_error = CopilotError(f"Could not start browser{' tab' if self.cdp_url else ''}: {e}")
             self._ready.set()
+            if pw:
+                pw.stop()
             return
         self._ready.set()
-        log.info("Browser started (visible=%s, stream mode=%s, markdown=%s)",
-                 self.show_window, self._stream_mode(), "on" if _to_md else "OFF")
-        if self.discover_models and self._models["source"] != "config":
-            self._refresh_models(page)
-
         try:
+            if self.aborted:            # cancelled while the tab was opening
+                return
+            log.info("%s started (visible=%s, stream mode=%s, markdown=%s)",
+                     "Browser tab" if self.cdp_url else "Browser", self._visible(), self._stream_mode(),
+                     "on" if _to_md else "OFF")
+            if self.discover_models and self._models["source"] != "config":
+                self._refresh_models(page)
             while True:
                 item = self._q.get()
-                if item is None:
+                if item is None or self.aborted:
                     break
                 if item[0] == "models":
                     fut = item[1]
@@ -585,13 +992,43 @@ class CopilotSession:
                     log.info("Prompt answered in %.1fs%s%s", time.time() - t0,
                              " (resumed chat)" if fut.resumed else "",
                              f" by model {fut.model!r}" if fut.model else "")
+                except SessionCancelled as e:
+                    fut.set_exception(e)
                 except Exception as e:
                     self._screenshot(page)
                     log.exception("Prompt failed")
                     fut.set_exception(e)
         finally:
-            ctx.close()
+            self._fail_queued()
+            try:
+                cleanup()
+            except Exception:
+                pass
             pw.stop()
+            log.info("%s closed", "Browser tab" if self.cdp_url else "Browser")
+
+    def _fail_queued(self):
+        """Fail prompts still waiting in the queue when the session stops."""
+        while True:
+            try:
+                item = self._q.get_nowait()
+            except queue.Empty:
+                return
+            if item and item[0] == "prompt":
+                fut = item[2]
+            elif item and item[0] == "models":
+                fut = item[1]
+            else:
+                continue
+            if fut.set_running_or_notify_cancel():
+                if item[0] == "models":
+                    fut.set_result([])
+                else:
+                    fut.set_exception(SessionCancelled("The session was stopped before this prompt ran."))
+
+    def _visible(self) -> bool:
+        f = getattr(self, "_is_visible", None)
+        return bool(f()) if f else self.show_window
 
     def _stream_mode(self):
         if config.STREAM_MODE == "markdown" and _to_md is None:
@@ -601,29 +1038,38 @@ class CopilotSession:
     def _screenshot(self, page):
         try:
             os.makedirs(config.LOG_DIR, exist_ok=True)
-            path = os.path.join(config.LOG_DIR, f"fail_{int(time.time())}.png")
+            path = os.path.join(config.LOG_DIR, f"fail_{self.name}_{int(time.time())}.png")
             page.screenshot(path=path, full_page=True)
             log.info("Saved failure screenshot: %s", path)
         except Exception:
             pass
 
     def _ensure_signed_in(self, page):
-        """If redirected to a Microsoft sign-in page, wait for the user (visible mode) or fail fast."""
+        """If redirected to a Microsoft sign-in page, wait for the user (window visible) or fail fast."""
         try:  # sign-in redirects can happen a moment after the page loads
             page.wait_for_load_state("networkidle", timeout=10000)
         except PWTimeout:
             pass
         if not _on_login_page(page):
+            self.needs_sign_in = False
             return
-        if not self.show_window:
-            raise LoginRequired("Not signed in - run once with --show and complete sign-in.")
-        print(f"\n>>> Please sign in to Microsoft 365 in the browser window "
-              f"(waiting up to {config.LOGIN_TIMEOUT // 60} min)...", flush=True)
-        try:
-            page.wait_for_url(lambda url: not _is_login_url(url) and "cloud.microsoft" in url,
-                              timeout=config.LOGIN_TIMEOUT * 1000)
-        except PWTimeout:
-            raise LoginRequired("Sign-in was not completed in time.")
+        self.needs_sign_in = True
+        if not self._visible():
+            raise LoginRequired("Not signed in - " + ("click Show browser in the manager and sign in."
+                                                       if getattr(self, "cdp_url", None) else
+                                                       "run once with --show and complete sign-in."))
+        log.warning("Waiting up to %d min for you to sign in to Microsoft 365 in the browser window...",
+                    config.LOGIN_TIMEOUT // 60)
+        if not getattr(self, "cdp_url", None):
+            print(f"\n>>> Please sign in to Microsoft 365 in the browser window "
+                  f"(waiting up to {config.LOGIN_TIMEOUT // 60} min)...", flush=True)
+        deadline = time.time() + config.LOGIN_TIMEOUT
+        while _is_login_url(page.url or "") or "cloud.microsoft" not in (page.url or ""):
+            self._check_abort()
+            if time.time() > deadline:
+                raise LoginRequired("Sign-in was not completed in time.")
+            page.wait_for_timeout(1000)
+        self.needs_sign_in = False
         log.info("Sign-in complete - session saved to %s", config.PROFILE_DIR)
         page.wait_for_load_state("domcontentloaded")
         if "/chat" not in page.url:
@@ -649,6 +1095,7 @@ class CopilotSession:
         """Options of the main menu or the open sub-menu, waiting for them to render."""
         deadline = time.time() + (timeout if timeout is not None else config.MODEL_TIMEOUT)
         while True:
+            self._check_abort()
             opts = self._menu(page, which)
             if opts:
                 return opts
@@ -722,7 +1169,7 @@ class CopilotSession:
                         keys[n] = checkmark_key(o)
 
             triggers = []
-            for i, o in enumerate(main):
+            for o in main:
                 if o.get("submenu"):
                     triggers.append(option_name(o))
                 else:
@@ -804,8 +1251,8 @@ class CopilotSession:
         Raises CopilotError if it can't."""
         with self._models_lock:
             path = self._models["paths"].get(name)
-        if path is None:   # model list from COPILOT_MODELS or stale: search all menus
-            path = next((p for n, p in self._models["paths"].items() if n.lower() == name.lower()), None)
+            if path is None:   # model list from COPILOT_MODELS or stale: search all menus
+                path = next((p for n, p in self._models["paths"].items() if n.lower() == name.lower()), None)
         before = self._read_current_model(page)
         if self._is_selected(page, name, path):
             return
@@ -859,6 +1306,7 @@ class CopilotSession:
         # Let the chat finish rendering, then compare its last reply.
         prev, deadline = None, time.time() + 10
         while time.time() < deadline:
+            self._check_abort()
             text = self._snapshot(page, new_only=False)["clean"]
             if text and text == prev:
                 break
@@ -924,6 +1372,7 @@ class CopilotSession:
         # 1) wait for the NEW reply (or Copilot's reasoning) to appear
         deadline = time.time() + config.START_TIMEOUT
         while True:
+            self._check_abort()
             snap = self._snapshot(page)
             if snap["found"] or snap["reasoning"]:
                 break
@@ -994,7 +1443,7 @@ class CopilotSession:
         try:
             d = os.path.join(config.LOG_DIR, "replies")
             os.makedirs(d, exist_ok=True)
-            stem = os.path.join(d, time.strftime("%Y%m%d-%H%M%S"))
+            stem = os.path.join(d, time.strftime("%Y%m%d-%H%M%S") + f"-{self.name}")
             with open(stem + ".html", "w", encoding="utf-8") as f:
                 f.write("\n<!-- block -->\n".join(blocks_html))
             with open(stem + ".md", "w", encoding="utf-8") as f:
@@ -1029,6 +1478,7 @@ class CopilotSession:
                 think = "closed"
 
         while time.time() < deadline:
+            self._check_abort()
             snap = self._snapshot(page)
             reasoning, text, blocks_html = snap["reasoning"], snap["text"], snap["blocks"]
             now = time.time()
