@@ -1,24 +1,32 @@
-import requests
+"""Example local client using the official OpenAI SDK (pip install openai).
 
-# 1. The address of your local API
-api_url = "http://localhost:5000/api/prompt"
+Lists the models in Copilot's model picker, then holds a two-turn
+conversation. The second request sends the first reply back in `messages`,
+so the server continues the same Copilot chat instead of starting a new one.
+With manager.py, change the port to use another session.
+"""
+from openai import OpenAI
 
-# 2. The message you want to send
-data_payload = {
-    "prompt": "What are three fun facts about the ocean?",
-    "debug": False  # Change to True if you want to watch the browser type
-}
+client = OpenAI(base_url="http://127.0.0.1:5000/v1", api_key="local")  # key is ignored
 
-print("Sending message to your local Copilot API...")
+for m in client.models.list():
+    print(m.id, "-", getattr(m, "name", ""))
+model = "m365-copilot"   # current selection; or e.g. "m365-copilot-auto"
 
-# 3. Send the POST request
-response = requests.post(api_url, json=data_payload)
+messages = [
+    {"role": "system", "content": "Answer in at most three bullet points."},
+    {"role": "user", "content": "What are three fun facts about the ocean?"},
+]
+resp = client.chat.completions.create(model=model, messages=messages)
+reply = resp.choices[0].message.content
+print(reply)
+if resp.choices[0].finish_reason == "length":
+    print("[reply was cut off by the server's time limit]")
 
-# 4. Read the response
-if response.status_code == 200:
-    # Extract the answer from the JSON data
-    answer = response.json().get("response")
-    print("\nCopilot says:\n")
-    print(answer)
-else:
-    print(f"Something went wrong! Error: {response.text}")
+# Follow-up in the same Copilot chat (streamed)
+messages += [{"role": "assistant", "content": reply},
+             {"role": "user", "content": "Expand on the second one."}]
+for chunk in client.chat.completions.create(model=model, stream=True, messages=messages):
+    if chunk.choices:
+        print(chunk.choices[0].delta.content or "", end="", flush=True)
+print()

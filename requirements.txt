@@ -1,2 +1,6 @@
-flask
-playwright
+playwright>=1.40
+psutil>=5.9         # recommended: fast, reliable process listing for manager.py (falls back to PowerShell)
+markdownify>=0.11   # needed for formatted (markdown) replies - without it replies are plain text
+pytest>=7           # optional: tests
+openai>=1.0         # optional: only for client.py and the SDK test
+# manager.py uses tkinter, which comes with the standard Windows Python installer
