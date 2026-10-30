@@ -150,7 +150,7 @@ def fast(monkeypatch):
 def new_future():
     f = Future()
     f.streamed_text, f.truncated, f.answer_plain = "", False, ""
-    f.chat_url, f.resumed = None, False
+    f.chat_url, f.resumed, f.model = None, False, None
     return f
 
 

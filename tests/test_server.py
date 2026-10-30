@@ -23,6 +23,7 @@ from copilot import CopilotError, LoginRequired, PromptTooLong  # noqa: E402
 
 REPLY = "Hello from Copilot! " * 10
 PIECES = ["<think>\nPondering.\n</think>\n\n", "## Hello", "\n\nThis is **streamed**.", "\n\n- one\n- two"]
+MODELS = ["Auto", "Quick response", "Think deeper", "GPT-5.6 Sol Quick response"]
 
 
 class FakeSession:
@@ -32,19 +33,30 @@ class FakeSession:
     alive, pending = True, 0
 
     def __init__(self):
-        self.last_prompt, self.last_resume = None, None
+        self.last_prompt, self.last_resume, self.last_model = None, None, None
         self.chats = {}            # url -> reply count
         self.broken = set()        # urls that fail to reopen
         self.n = 0
+        self.names = list(MODELS)
+        self.current_model = "Auto"
 
-    def submit(self, prompt, on_delta=None, resume=None):
-        self.last_prompt, self.last_resume = prompt, resume
+    def model_names(self, wait=0.0):
+        return list(self.names)
+
+    def model_keys(self):
+        return {"GPT-5.6 Sol Quick response": "Gpt_5_6_Chat"}
+
+    def submit(self, prompt, on_delta=None, resume=None, model=None):
+        self.last_prompt, self.last_resume, self.last_model = prompt, resume, model
         fut = Future()
         fut.streamed_text, fut.truncated, fut.answer_plain = "", False, ""
-        fut.chat_url, fut.resumed = None, False
+        fut.chat_url, fut.resumed, fut.model = None, False, None
         fut.set_running_or_notify_cancel()
 
         def work():
+            if model:
+                self.current_model = model
+            fut.model = self.current_model
             if "slow" in prompt:
                 time.sleep(0.3)
             if "truncated" in prompt:
@@ -82,7 +94,9 @@ class FakeSession:
 
 
 @pytest.fixture()
-def url(tmp_path):
+def url(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "MODEL_ID", "m365-copilot")
+    monkeypatch.setattr(config, "STRICT_MODELS", False)
     server.Handler.session = FakeSession()
     store = ConversationStore(str(tmp_path / "conversations.db"))
     server.Handler.store = store
@@ -117,28 +131,22 @@ def stream_chunks(body):
     return [json.loads(e) for e in sse_events(body)[:-1]]
 
 
-def chat(url, messages, stream=False):
+def chat(url, messages, stream=False, model="m"):
     if stream:
         _, body = req(url, "POST", "/v1/chat/completions",
-                      {"model": "m", "messages": messages, "stream": True}, raw=True)
+                      {"model": model, "messages": messages, "stream": True}, raw=True)
         return "".join(c["choices"][0]["delta"].get("content", "") for c in stream_chunks(body) if c["choices"])
-    return req(url, "POST", "/v1/chat/completions", {"model": "m", "messages": messages})[1][
+    return req(url, "POST", "/v1/chat/completions", {"model": model, "messages": messages})[1][
         "choices"][0]["message"]["content"]
 
 
 # ---------------------------------------------------------------- basics
-def test_models(url):
-    s, b = req(url, "GET", "/v1/models")
-    assert s == 200 and b["object"] == "list" and b["data"][0]["id"] == "m365-copilot"
-    assert req(url, "GET", "/v1/models/gpt-4o")[1]["id"] == "gpt-4o"
-
-
 def test_completion_shape(url):
     s, b = req(url, "POST", "/v1/chat/completions", user("hi"))
     assert s == 200 and b["object"] == "chat.completion" and b["id"].startswith("chatcmpl-")
     c = b["choices"][0]
     assert c["message"]["role"] == "assistant" and "Answer" in c["message"]["content"]
-    assert c["finish_reason"] == "stop" and "usage" in b
+    assert c["finish_reason"] == "stop" and "usage" in b and b["model"] == "m365-copilot"
     assert server.Handler.session.last_prompt == "hi"
 
 
@@ -240,6 +248,7 @@ def test_errors_openai_shape(url):
 def test_health(url):
     b = req(url, "GET", "/health")[1]
     assert b["status"] == "ok" and b["stored_conversations"] == 0
+    assert b["models"] == MODELS and b["current_model"] == "Auto"
 
 
 def test_keepalive_after_404_and_system_prompt(url):
@@ -281,6 +290,62 @@ def test_chunked_body_with_long_system_prompt(url):
     assert p.startswith("Instructions:\nRule.") and p.endswith("what do you know about trainops?")
 
 
+# ---------------------------------------------------------------- models
+def test_models_list(url):
+    s, b = req(url, "GET", "/v1/models")
+    assert s == 200 and b["object"] == "list"
+    assert [m["id"] for m in b["data"]] == ["m365-copilot", "m365-copilot-auto", "m365-copilot-quick-response",
+                                            "m365-copilot-think-deeper", "m365-copilot-gpt-5-6-sol-quick-response"]
+    assert b["data"][0]["name"] == "Current selection (Auto)" and b["data"][3]["name"] == "Think deeper"
+
+
+def test_model_lookup(url):
+    assert req(url, "GET", "/v1/models/m365-copilot-think-deeper")[1]["name"] == "Think deeper"
+    assert req(url, "GET", "/v1/models/gpt-4o")[1]["id"] == "gpt-4o"      # lenient by default
+
+
+def test_model_lookup_strict(url, monkeypatch):
+    monkeypatch.setattr(config, "STRICT_MODELS", True)
+    assert req(url, "GET", "/v1/models/gpt-4o")[0] == 404
+
+
+def test_request_selects_model(url):
+    fake = server.Handler.session
+    s, b = req(url, "POST", "/v1/chat/completions", {**user("hi"), "model": "m365-copilot-think-deeper"})
+    assert s == 200 and fake.last_model == "Think deeper" and b["model"] == "m365-copilot-think-deeper"
+    req(url, "POST", "/v1/chat/completions", {**user("hi"), "model": "Quick Response"})
+    assert fake.last_model == "Quick response"
+    req(url, "POST", "/v1/chat/completions", user("hi"))                    # m365-copilot
+    assert fake.last_model is None
+
+
+def test_unknown_model_uses_current_selection(url):
+    fake = server.Handler.session
+    s, b = req(url, "POST", "/v1/chat/completions", {**user("hi"), "model": "test"})
+    assert s == 200 and fake.last_model is None and b["model"] == "test"
+
+
+def test_unknown_model_strict(url, monkeypatch):
+    monkeypatch.setattr(config, "STRICT_MODELS", True)
+    s, b = req(url, "POST", "/v1/chat/completions", {**user("hi"), "model": "gpt-4o"})
+    assert s == 400 and b["error"]["code"] == "model_not_found"
+    assert "m365-copilot-think-deeper" in b["error"]["message"]
+
+
+def test_submenu_model_by_id_name_or_key(url):
+    fake = server.Handler.session
+    for m in ("m365-copilot-gpt-5-6-sol-quick-response", "GPT-5.6 Sol Quick response", "Gpt_5_6_Chat",
+              "gpt-5-6-chat"):
+        fake.last_model = None
+        s, _ = req(url, "POST", "/v1/chat/completions", {**user("hi"), "model": m})
+        assert s == 200 and fake.last_model == "GPT-5.6 Sol Quick response", m
+
+
+def test_streaming_selects_model(url):
+    chat(url, [{"role": "user", "content": "hi"}], stream=True, model="m365-copilot-auto")
+    assert server.Handler.session.last_model == "Auto"
+
+
 # ---------------------------------------------------------------- conversation resuming
 SYSTEM = {"role": "system", "content": "You are the TrainOps assistant. " * 50}
 
@@ -302,6 +367,19 @@ def test_resume_sends_only_new_message(url):
     chat(url, msgs)
     assert fake.sent_prompt == "Q3" and fake.last_resume["turns"] == 2
     assert fake.chats[first_url] == 3
+
+
+def test_resume_same_model_continues_other_model_starts_new_chat(url):
+    fake = server.Handler.session
+    msgs = [SYSTEM, {"role": "user", "content": "Q1"}]
+    a1 = chat(url, msgs, model="m365-copilot-think-deeper")
+    msgs += [{"role": "assistant", "content": a1}, {"role": "user", "content": "Q2"}]
+    chat(url, msgs, model="m365-copilot-think-deeper")
+    assert fake.sent_prompt == "Q2" and len(fake.chats) == 1
+    a2 = chat(url, msgs[:-1] + [{"role": "user", "content": "Q2"}], model="m365-copilot")  # current: resumes
+    msgs2 = msgs + [{"role": "assistant", "content": a2}, {"role": "user", "content": "Q3"}]
+    chat(url, msgs2, model="m365-copilot-quick-response")                   # different model: new chat
+    assert fake.last_resume is None and "Conversation so far" in fake.sent_prompt
 
 
 def test_resume_tolerates_client_reformatting_reply(url):
@@ -379,17 +457,6 @@ def test_resume_disabled(url):
     assert fake.last_resume is None and len(fake.chats) == 2
 
 
-def test_openai_sdk(url):
-    openai = pytest.importorskip("openai")
-    c = openai.OpenAI(base_url=url + "/v1", api_key="x")
-    r = c.chat.completions.create(model="m365-copilot", messages=[{"role": "user", "content": "hi"}])
-    assert "Answer" in r.choices[0].message.content
-    out = "".join(ch.choices[0].delta.content or "" for ch in
-                  c.chat.completions.create(model="m", stream=True, messages=[{"role": "user", "content": "hi"}])
-                  if ch.choices)
-    assert out == "".join(PIECES)
-
-
 # ---------------------------------------------------------------- stream always finishes
 def test_stream_finishes_even_if_recording_fails(url, monkeypatch):
     def broken_put(*a, **k):
@@ -402,14 +469,14 @@ def test_stream_finishes_even_if_recording_fails(url, monkeypatch):
     assert finishes[-1] == "stop"
 
 
-def test_stream_ends_if_worker_never_finishes(url, monkeypatch):
-    class Stuck:
-        alive, pending = True, 0
+class Stuck(FakeSession):
+    def submit(self, prompt, on_delta=None, resume=None, model=None):
+        f = Future()
+        f.set_running_or_notify_cancel()
+        return f
 
-        def submit(self, prompt, on_delta=None, resume=None):
-            f = Future()
-            f.set_running_or_notify_cancel()
-            return f
+
+def test_stream_ends_if_worker_never_finishes(url, monkeypatch):
     server.Handler.session = Stuck()
     monkeypatch.setattr(server, "KEEPALIVE_SECONDS", 0.05)
     monkeypatch.setattr(server, "result_timeout", lambda: -29.8)   # deadline ~0.2 s after start
@@ -419,15 +486,22 @@ def test_stream_ends_if_worker_never_finishes(url, monkeypatch):
 
 
 def test_stream_ends_if_worker_dies(url, monkeypatch):
-    class Dead:
-        alive, pending = False, 0
-
-        def submit(self, prompt, on_delta=None, resume=None):
-            f = Future()
-            f.set_running_or_notify_cancel()
-            return f
-    server.Handler.session = Dead()
+    dead = Stuck()
+    dead.alive = False
+    server.Handler.session = dead
     monkeypatch.setattr(server, "KEEPALIVE_SECONDS", 0.05)
     s, body = req(url, "POST", "/v1/chat/completions", user("hi", stream=True), raw=True)
     events = sse_events(body)
     assert events[-1] == "[DONE]" and json.loads(events[-2])["error"]["code"] == "automation_failed"
+
+
+def test_openai_sdk(url):
+    openai = pytest.importorskip("openai")
+    c = openai.OpenAI(base_url=url + "/v1", api_key="x")
+    assert [m.id for m in c.models.list()][0] == "m365-copilot"
+    r = c.chat.completions.create(model="m365-copilot", messages=[{"role": "user", "content": "hi"}])
+    assert "Answer" in r.choices[0].message.content
+    out = "".join(ch.choices[0].delta.content or "" for ch in
+                  c.chat.completions.create(model="m", stream=True, messages=[{"role": "user", "content": "hi"}])
+                  if ch.choices)
+    assert out == "".join(PIECES)

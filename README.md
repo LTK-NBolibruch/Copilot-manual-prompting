@@ -20,13 +20,15 @@ python server.py                       # http://127.0.0.1:5000/v1
 
 | Setting | Value |
 |---|---|
-| Base URL | `http://127.0.0.1:5000/v1` |
+| Base URL | `http://127.0.0.1:5000/v1` (**http**, not https) |
 | API key | anything (e.g. `local`); some clients refuse an empty key |
-| Model | `m365-copilot` (any name is accepted) |
+| Model | `m365-copilot` (current selection) or one from `/v1/models` |
 
 ```python
 from openai import OpenAI
 client = OpenAI(base_url="http://127.0.0.1:5000/v1", api_key="local")
+
+print([m.id for m in client.models.list()])
 
 # normal
 r = client.chat.completions.create(model="m365-copilot", messages=[{"role": "user", "content": "Hello"}])
@@ -44,9 +46,48 @@ for chunk in client.chat.completions.create(model="m365-copilot", stream=True,
 | Method | Path | Notes |
 |---|---|---|
 | POST | `/v1/chat/completions` (also `/v1`) | Supports `stream: true/false` and `stream_options.include_usage` |
-| GET | `/v1/models` | Lists `m365-copilot` |
-| GET | `/v1/models/{id}` | Echoes any id, so hard-coded model names work |
-| GET | `/health` | Worker status, queue depth and number of stored conversations |
+| GET | `/v1/models` | The models in Copilot's model picker (see *Models*) |
+| GET | `/v1/models/{id}` | One model |
+| GET | `/health` | Worker status, queue depth, models, current model and number of stored conversations |
+
+## Models
+
+`/v1/models` lists the models in Copilot's **model picker**, read from the web UI.
+
+1. **Reading the list.** At startup, the server opens the picker (`#gptModeSwitcher`) and reads the option names. **Sub-menus are read too:** for an entry that opens a sub-menu (such as `GPT-5.6 Sol`), the server opens it and adds its models (for example `GPT-5.6 Sol Quick response` and `GPT-5.6 Sol Think deeper`). It then closes the menus. The list is re-read every `COPILOT_MODELS_REFRESH_MINUTES` (60), in the background.
+2. **The IDs.** Each model gets an ID made from its name. `m365-copilot` on its own means "whatever is currently selected":
+
+   ```
+   m365-copilot                              current selection (no switching)
+   m365-copilot-auto                         Auto
+   m365-copilot-think-deeper                 Think deeper
+   m365-copilot-gpt-5-6-sol-quick-response   GPT-5.6 Sol Quick response
+   m365-copilot-gpt-5-6-sol-think-deeper     GPT-5.6 Sol Think deeper
+   ```
+
+   Each entry also has a `name` field with the name exactly as the picker shows it.
+3. **Selecting a model.** When a request's `model` names one of them, the server selects it in the picker before sending the prompt, opening its sub-menu first if needed. It skips that if the model is already selected. These all work, and case doesn't matter:
+   - the full ID
+   - the picker name (`"GPT-5.6 Sol Think deeper"`)
+   - the short form (`gpt-5-6-sol-think-deeper`)
+   - Copilot's internal key from the option's checkmark icon (`Gpt_5_6_Reasoning`)
+4. **Ambiguous button labels.** If the picker button shows a label that could mean more than one model, for example `Think deeper` for both the top-level model and the sub-menu one, the server checks which option has the checkmark in the menu.
+5. **Unknown model names** (for example `gpt-4o`, or `test`) use the current selection and log a warning, so clients with hard-coded names keep working. Set `COPILOT_STRICT_MODELS=1` to reject them with a 400 error that lists the valid IDs instead.
+6. **Resumed chats.** A follow-up continues its Copilot chat when the request asks for the same model the chat used, or for `m365-copilot`. Asking for a different model starts a new chat.
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `COPILOT_MODELS` | – | Comma-separated names to list **instead of** reading the picker, e.g. `Auto,Think deeper`. Use it to hide models, or if reading the picker fails. |
+| `COPILOT_MODEL_ID` | `m365-copilot` | ID meaning "current selection"; also the prefix of the other IDs |
+| `COPILOT_MODELS_REFRESH_MINUTES` | `60` | How often to re-read the picker |
+| `COPILOT_STRICT_MODELS` | `0` | `1` = reject unknown model names with HTTP 400 |
+| `COPILOT_MODEL_PICKER_SEL` | `#gptModeSwitcher` | The picker button |
+| `COPILOT_MODEL_MENU_SEL` / `COPILOT_MODEL_OPTION_SEL` | `[role="menu"]` … / `[role="menuitemradio"]` … | The open menu and its options |
+| `COPILOT_MODEL_SUBMENU_SEL` | `[aria-haspopup="menu"]` … | Options that open a sub-menu of more models |
+
+- **Checking it worked.** The startup log shows each model with its menu path, for example `Models in the picker: Auto, ..., GPT-5.6 Sol > GPT-5.6 Sol Think deeper (selected: Auto)`. If it shows `Could not read the model list`, only `m365-copilot` is listed. Check the menu selectors in DevTools, or set `COPILOT_MODELS`.
+- **Sub-menus that won't open.** These are logged as `Could not read these model sub-menus`, and the main-menu models are still listed. The server tries clicking the entry, then hovering over it, then pressing the right arrow key. If none of those opens it, check `COPILOT_MODEL_SUBMENU_SEL`.
+- **From the command line.** `python ask.py --models` lists the models, and `python ask.py --model "Think deeper" "..."` uses one.
 
 ## Formatting (markdown)
 
@@ -58,18 +99,13 @@ Replies are returned as markdown: headings, bold and italics, lists, tables, lin
 2. **Convert Copilot's own markup.** Tables, lists and headings that Copilot builds from `<div role="table">`, `role="row"`, `role="heading"` and similar elements are turned into real HTML tables, lists and headings. Text made bold or italic with inline styles is turned into `<strong>` and `<em>`.
 3. **Convert to markdown.** `markdownify` converts the result. Underscores aren't escaped, so identifiers like `run_sdr` and `trip_id` come through unchanged.
 
-**Plain-text safety net.** If the markdown has much less text than the cleaned reply (less than 80%), the server assumes the conversion lost content. It sends the plain page text instead and logs `Markdown conversion has N of M letters/digits`. In v6–v8 this check compared against the page text *including* buttons and source lists, so most replies failed it and came back unformatted. It now compares like with like.
+**Plain-text safety net.** If the markdown has much less text than the cleaned reply (less than 80%), the server assumes the conversion lost content. It sends the plain page text instead and logs `Markdown conversion has N of M letters/digits`.
 
-**If replies are still unformatted:**
+**If replies are unformatted:**
 
 - **Check the startup log.** It should say `markdown=on`. If you see `markdownify is not installed`, run `pip install markdownify`.
-- **Look for the safety-net warning.** If `logs/server.log` shows `Markdown conversion has N of M`, the conversion is still losing text.
-- **Capture a reply for diagnosis.** Set `COPILOT_DEBUG_REPLIES=1`, send one prompt, and look in `logs/replies/`. Each reply is saved as:
-  - `.html`: the cleaned HTML that was converted
-  - `.md`: the markdown produced from it
-  - `.txt`: the page text
-  
-  Comparing those shows where the formatting is lost. They contain the reply text, so delete them when you're done.
+- **Look for the safety-net warning.** If `logs/server.log` shows `Markdown conversion has N of M`, the conversion is losing text.
+- **Capture a reply for diagnosis.** Set `COPILOT_DEBUG_REPLIES=1`, send one prompt, and look in `logs/replies/`. Each reply is saved as `.html` (the cleaned HTML that was converted), `.md` (the markdown produced from it) and `.txt` (the page text). They contain the reply text, so delete them when you're done.
 
 ## Finding the new reply
 
@@ -80,13 +116,7 @@ To read Copilot's answer, the server has to pick the right element on the page. 
 3. **Pick the reply.** Only an unmarked element that comes **after** the old replies and after your message counts as the new reply.
 4. **Wait for it.** The server waits until that element, or Copilot's reasoning, appears before it starts reading. If it never appears, the request fails after `COPILOT_START_TIMEOUT` with a message pointing at `COPILOT_REPLY_SEL`.
 
-Before v10, the server instead waited for the *number* of reply elements to go up and then read the last one. Several things raised that number before Copilot replied: your own message bubble, older history loading into a resumed chat, and wrapper elements being re-rendered. The server then streamed the wrong text (your prompt or the previous answer) and could treat it as finished before the real answer arrived. It also recorded the wrong reply for conversation resuming.
-
-**Streams always end properly.** A streamed response always finishes with a final chunk (or an error event) and `data: [DONE]`, even if:
-
-- recording the conversation fails
-- the browser worker stops
-- no reply arrives within the time limits
+**Streams always end properly.** A streamed response always finishes with a final chunk (or an error event) and `data: [DONE]`, even if recording the conversation fails, the browser worker stops, or no reply arrives within the time limits.
 
 ## Resuming conversations
 
@@ -94,10 +124,10 @@ OpenAI clients send the whole conversation with every request. Instead of starti
 
 **How it works:**
 
-1. After each reply, the server records which Copilot chat (`.../chat/conversation/<id>`) now holds the conversation. The record goes in a local SQLite file, `conversations.db`. It's keyed on a hash of every message, including the reply just sent.
+1. After each reply, the server records which Copilot chat (`.../chat/conversation/<id>`) now holds the conversation, and which model answered. The record goes in a local SQLite file, `conversations.db`. It's keyed on a hash of every message, including the reply just sent.
 2. On the next request, it hashes the earlier messages, everything except the new user message, and looks them up.
 3. **If there's a match,** the server reopens that chat and checks that its last reply is the one it recorded. If it is, it sends only the new message, so the system prompt isn't sent again.
-4. **If there's no match, or the check fails,** it starts a new chat with the full history pasted in, as before, and records that chat instead.
+4. **If there's no match, or the check fails,** it starts a new chat with the full history pasted in, and records that chat instead.
 
 **Matching ignores formatting.** The hashes ignore whitespace, punctuation, markdown and `<think>` blocks, so a client that stores replies slightly differently, or drops the reasoning, still matches.
 
@@ -106,6 +136,7 @@ OpenAI clients send the whole conversation with every request. Instead of starti
 | Normal follow-up | Same chat; only the new message is sent |
 | You regenerate or edit an earlier message | No match, or the chat has moved on, so a new chat starts |
 | The system prompt changes | No match, so a new chat starts |
+| The request asks for a different model than the chat used | A new chat starts |
 | The chat was deleted or won't load | The check fails, so a new chat starts and the next turn resumes that one |
 | The chat reaches `COPILOT_MAX_TURNS` (30) | A new chat starts |
 | The sign-in has expired | 503 `login_required`, as for any request |
@@ -121,9 +152,8 @@ OpenAI clients send the whole conversation with every request. Instead of starti
 | `COPILOT_RESUME_LOAD_TIMEOUT` | `30` | Seconds to wait for a reopened chat to load |
 | `COPILOT_LOG_CONVERSATIONS` | `0` | Set to `1` to also append the full prompts and replies to `logs/conversations.jsonl`, for debugging |
 
-- **After upgrading to v10.** Chats recorded by v9 or earlier won't resume, because the reply fingerprint is now taken from the cleaned reply text. Each such conversation starts one new chat, then resumes normally.
-- **What's stored.** `conversations.db` holds only hashes, chat URLs and turn counts, no prompt or reply text. It's listed in `.gitignore`. Delete it at any time to forget all chats.
-- **The log.** Each request is logged as `resumed` or `new-chat` in `logs/server.log`, along with the reason when a stored chat couldn't be continued.
+- **What's stored.** `conversations.db` holds only hashes, chat URLs, turn counts and model names, no prompt or reply text. It's listed in `.gitignore`. Delete it at any time to forget all chats. A database from an earlier version is upgraded automatically.
+- **The log.** Each request is logged as `resumed` or `new-chat`, with the model that answered, in `logs/server.log`, along with the reason when a stored chat couldn't be continued.
 
 ## Reasoning (`<think>` tags)
 
@@ -191,6 +221,7 @@ When the reply finishes, the server always sends whatever the client hasn't rece
 
 | Feature | Behaviour |
 |---|---|
+| `model` | Selects that model in Copilot's picker (see *Models*). `m365-copilot` keeps the current selection. The response echoes the `model` you sent. |
 | `messages` | A follow-up to a stored conversation continues that Copilot chat (see *Resuming conversations*). Otherwise a **new Copilot chat** starts: a single user message is sent unchanged, and for longer histories, system/developer messages become an "Instructions:" block and earlier turns become a "Conversation so far:" transcript, followed by the latest user message. |
 | `usage` | Always 0, because Copilot doesn't report token counts. |
 | `finish_reason` | `"stop"`, or `"length"` if `COPILOT_REPLY_TIMEOUT` cut the reply off. |
@@ -203,8 +234,9 @@ When the reply finishes, the server always sends whatever the client hasn't rece
 | Status | `code` | Meaning |
 |---|---|---|
 | 400 | `invalid_request` | Bad JSON or missing `messages` |
+| 400 | `model_not_found` | Unknown model, with `COPILOT_STRICT_MODELS=1` |
 | 400 | `context_length_exceeded` | Copilot's chat box cut off the prompt; shorten system prompt + history |
-| 502 | `automation_failed` | Usually a Copilot UI change; check `logs/` (screenshot saved) |
+| 502 | `automation_failed` | Usually a Copilot UI change, or a model that couldn't be selected; check `logs/` (screenshot saved) |
 | 503 | `login_required` | Re-run the sign-in step |
 | 504 | `timeout` | No reply at all within the time limits |
 
@@ -214,15 +246,17 @@ When the reply finishes, the server always sends whatever the client hasn't rece
 python ask.py "What is a flaky test?"
 python ask.py --stream "Explain headway in two paragraphs"
 python ask.py -i --stream              # interactive, streamed
+python ask.py --models                 # list the models in the picker
+python ask.py --model "Think deeper" "Compare T0 and T1 batch mode"
 ```
 
 `ask.py` always starts a new chat for each prompt. Stop the server before using it, because both use the same browser profile.
 
 ## Notes
 
-- **One prompt at a time.** Concurrent requests queue up behind each other.
+- **One prompt at a time.** Concurrent requests queue up behind each other, and so does re-reading the model list.
 - **Client timeouts.** Set the client timeout above `COPILOT_REPLY_TIMEOUT` (600 s). The OpenAI SDK's default is also 600 s, so raise it or lower the server limit.
-- **Logs.** `logs/server.log` records each request, whether it resumed a chat, and how each reply ended (`stable`, `stuck` or `timeout`). For streamed replies it also records how long until the first text arrived and how much was streamed versus the final reply.
+- **Logs.** `logs/server.log` records each request, whether it resumed a chat, which model answered, and how each reply ended (`stable`, `stuck` or `timeout`). For streamed replies it also records how long until the first text arrived and how much was streamed versus the final reply.
 - **Re-sign-in.** Stop the server, run `python ask.py --show "Reply with OK"`, then start it again.
-- **Settings.** Selectors, timeouts, poll intervals, stream mode, reasoning tags, conversation resuming, debugging and port and model name are in `config.py`, and each can be overridden with a `COPILOT_*` environment variable.
-- **Tests.** Run `pytest -q`. The browser is mocked; reply reading, formatting, streaming and chat resuming are tested against simulated Copilot pages. The reply-picking logic runs in Node, which is skipped if `node` isn't installed. The browser-side scripts have not been tested against the real page.
+- **Settings.** Selectors, timeouts, poll intervals, stream mode, reasoning tags, models, conversation resuming, debugging, port and model ID are in `config.py`, and each can be overridden with a `COPILOT_*` environment variable.
+- **Tests.** Run `pytest -q`. The browser is mocked; reply reading, formatting, streaming, model selection and chat resuming are tested against simulated Copilot pages. The reply-picking logic runs in Node, which is skipped if `node` isn't installed. The browser-side scripts have not been tested against the real page.

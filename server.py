@@ -7,7 +7,7 @@ Point any OpenAI client at base_url="http://127.0.0.1:5000/v1" with any api_key
 (it is ignored - no authentication, localhost only).
 
 Endpoints:
-    GET  /v1/models
+    GET  /v1/models             models in Copilot's model picker
     GET  /v1/models/{id}
     POST /v1/chat/completions   (stream true/false; also accepted at POST /v1)
     GET  /health
@@ -26,6 +26,7 @@ import config
 from conversations import (ConversationStore, fingerprint, history_key, log_conversation, strip_reasoning,
                            text_of)
 from copilot import CopilotSession, CopilotError, LoginRequired, PromptTooLong
+from models import model_id, resolve
 
 log = logging.getLogger("server")
 MAX_BODY = 5_000_000
@@ -34,8 +35,11 @@ CREATED = int(time.time())
 _DONE = object()  # end-of-stream sentinel
 
 
-def model_obj():
-    return {"id": config.MODEL_ID, "object": "model", "created": CREATED, "owned_by": "microsoft"}
+def model_obj(mid, name=None):
+    obj = {"id": mid, "object": "model", "created": CREATED, "owned_by": "microsoft"}
+    if name:
+        obj["name"] = name
+    return obj
 
 
 def clean_messages(messages):
@@ -97,14 +101,14 @@ def finish_reason(fut):
 
 def result_timeout():
     return (config.REPLY_TIMEOUT + config.START_TIMEOUT + config.INPUT_TIMEOUT
-            + config.RESUME_LOAD_TIMEOUT + 120)
+            + config.RESUME_LOAD_TIMEOUT + 2 * config.MODEL_TIMEOUT + 120)
 
 
 class Handler(BaseHTTPRequestHandler):
     session: CopilotSession = None
     store: ConversationStore = None   # None = resuming disabled
     protocol_version = "HTTP/1.1"
-    server_version = "CopilotLocal/1.7"
+    server_version = "CopilotLocal/1.9"
 
     # ---------- helpers
     def _json(self, status, obj):
@@ -144,8 +148,31 @@ class Handler(BaseHTTPRequestHandler):
     def _path(self):
         return self.path.split("?")[0].rstrip("/")
 
+    # ---------- models
+    def _model_names(self):
+        return self.session.model_names(wait=config.MODEL_TIMEOUT * 3)
+
+    def _models_list(self):
+        names = self._model_names()
+        current = self.session.current_model
+        data = [model_obj(config.MODEL_ID, f"Current selection ({current})" if current else "Current selection")]
+        data += [model_obj(model_id(n), n) for n in names]
+        return data
+
+    def _resolve_model(self, requested):
+        """(picker name or None, error message or None) for a request's "model"."""
+        names = self._model_names()
+        name, known = resolve(requested, names, self.session.model_keys())
+        if known:
+            return name, None
+        valid = [config.MODEL_ID] + [model_id(n) for n in names]
+        if config.STRICT_MODELS:
+            return None, f"Unknown model {requested!r}. Available: {', '.join(valid)}"
+        log.warning("Unknown model %r - using the current selection. Available: %s", requested, ", ".join(valid))
+        return None, None
+
     # ---------- conversation resuming
-    def _plan_resume(self, messages):
+    def _plan_resume(self, messages, model=None):
         """resume dict for CopilotSession.submit(), or None to start a new chat."""
         if self.store is None:
             return None
@@ -157,6 +184,10 @@ class Handler(BaseHTTPRequestHandler):
             return None
         if hit["turns"] >= config.MAX_TURNS:
             log.info("Chat %s reached COPILOT_MAX_TURNS=%d - starting a new chat", hit["url"], config.MAX_TURNS)
+            return None
+        if model and hit.get("model") and hit["model"].lower() != model.lower():
+            log.info("Chat %s was answered by %r, this request asks for %r - starting a new chat",
+                     hit["url"], hit["model"], model)
             return None
         return {**hit, "prompt": text_of(msgs[-1]["content"]).strip()}
 
@@ -171,7 +202,7 @@ class Handler(BaseHTTPRequestHandler):
             turns = resume["turns"] + 1 if getattr(fut, "resumed", False) and resume else 1
             history = clean_messages(messages)
             self.store.put(history_key(history + [{"role": "assistant", "content": reply}]),
-                           fut.chat_url, turns, fingerprint(fut.answer_plain))
+                           fut.chat_url, turns, fingerprint(fut.answer_plain), getattr(fut, "model", None))
         except Exception:
             log.exception("Could not record the conversation (the reply was still sent)")
 
@@ -189,12 +220,23 @@ class Handler(BaseHTTPRequestHandler):
         if p in ("/health", "/v1/health"):
             return self._json(200, {"status": "ok", "worker_alive": self.session.alive,
                                     "queue_depth": self.session.pending,
+                                    "current_model": self.session.current_model,
+                                    "models": self.session.model_names(),
                                     "stored_conversations": len(self.store) if self.store is not None else None})
         if p == "/v1/models":
-            return self._json(200, {"object": "list", "data": [model_obj()]})
+            return self._json(200, {"object": "list", "data": self._models_list()})
         if p.startswith("/v1/models/"):
+            mid = p.rsplit("/", 1)[1]
+            for m in self._models_list():
+                if m["id"] == mid:
+                    return self._json(200, m)
+            name, known = resolve(mid, self.session.model_names(), self.session.model_keys())
+            if known and name:
+                return self._json(200, model_obj(model_id(name), name))
+            if config.STRICT_MODELS:
+                return self._error(404, f"Unknown model {mid!r}.", code="model_not_found")
             # accept any model id so clients with hard-coded names still work
-            return self._json(200, {**model_obj(), "id": p.rsplit("/", 1)[1]})
+            return self._json(200, model_obj(mid))
         self._error(404, f"Unknown endpoint: GET {p}", code="not_found")
 
     def do_POST(self):
@@ -222,17 +264,20 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as e:
             return self._error(400, str(e))
 
-        resume = self._plan_resume(messages)
-        model = body.get("model") or config.MODEL_ID
+        requested = body.get("model") or config.MODEL_ID
+        select, err = self._resolve_model(requested)
+        if err:
+            return self._error(400, err, code="model_not_found")
+        resume = self._plan_resume(messages, select)
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(time.time())
         t0 = time.time()
 
         if body.get("stream"):
-            return self._stream(prompt, resume, messages, model, cid, created, body, t0)
+            return self._stream(prompt, resume, select, messages, requested, cid, created, body, t0)
 
         try:
-            fut = self.session.submit(prompt, resume=resume)
+            fut = self.session.submit(prompt, resume=resume, model=select)
             text = fut.result(timeout=result_timeout())
         except Exception as e:
             status, etype, code = error_status(e)
@@ -242,29 +287,29 @@ class Handler(BaseHTTPRequestHandler):
 
         self._record(messages, fut, text, resume)
         reason = finish_reason(fut)
-        log.info("completion %s %.1fs in=%d out=%d chars finish=%s %s",
+        log.info("completion %s %.1fs in=%d out=%d chars finish=%s %s model=%s",
                  cid, time.time() - t0, len(prompt), len(text), reason,
-                 "resumed" if getattr(fut, "resumed", False) else "new-chat")
+                 "resumed" if getattr(fut, "resumed", False) else "new-chat", getattr(fut, "model", None))
         self._json(200, {
-            "id": cid, "object": "chat.completion", "created": created, "model": model,
+            "id": cid, "object": "chat.completion", "created": created, "model": requested,
             "system_fingerprint": None,
             "choices": [{"index": 0, "message": {"role": "assistant", "content": text, "refusal": None},
                          "logprobs": None, "finish_reason": reason}],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         })
 
-    def _stream(self, prompt, resume, messages, model, cid, created, body, t0):
+    def _stream(self, prompt, resume, select, messages, model, cid, created, body, t0):
         """Live Server-Sent Events.
 
         The worker pushes each new piece of Copilot's reply into a queue as it
         appears on the page and, when the reply ends, whatever the client has
         not received yet. This thread forwards them as chat.completion.chunk
-        events, with keep-alive comments while idle. The queue is drained
-        completely before the final chunk is sent.
+        events, with keep-alive comments while idle. The stream always ends
+        with a final chunk or an error event, then [DONE].
         """
         events: "queue.Queue" = queue.Queue()
         try:
-            fut = self.session.submit(prompt, on_delta=events.put, resume=resume)
+            fut = self.session.submit(prompt, on_delta=events.put, resume=resume, model=select)
         except Exception as e:
             status, etype, code = error_status(e)
             return self._error(status, str(e), etype, code)
@@ -328,9 +373,9 @@ class Handler(BaseHTTPRequestHandler):
                     send({"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
                           "choices": [], "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}})
                 ttft = f"{first_token_at - t0:.1f}s" if first_token_at else "n/a"
-                log.info("stream %s %.1fs first-text=%s in=%d streamed=%d final=%d chars finish=%s %s",
+                log.info("stream %s %.1fs first-text=%s in=%d streamed=%d final=%d chars finish=%s %s model=%s",
                          cid, time.time() - t0, ttft, len(prompt), len(client_text), len(fut.result()), reason,
-                         "resumed" if getattr(fut, "resumed", False) else "new-chat")
+                         "resumed" if getattr(fut, "resumed", False) else "new-chat", getattr(fut, "model", None))
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 raise
             except Exception as exc:  # anything else: tell the client, then end the stream properly
@@ -363,8 +408,8 @@ def main():
     Handler.store = ConversationStore() if config.RESUME_CONVERSATIONS else None
     Handler.session = CopilotSession(show_window=args.show)
     server = ThreadingHTTPServer((config.HOST, args.port), Handler)
-    log.info("OpenAI-compatible API at http://%s:%d/v1  (model: %s, resume chats: %s)", config.HOST, args.port,
-             config.MODEL_ID, "on" if Handler.store is not None else "off")
+    log.info("OpenAI-compatible API at http://%s:%d/v1  (resume chats: %s)", config.HOST, args.port,
+             "on" if Handler.store is not None else "off")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

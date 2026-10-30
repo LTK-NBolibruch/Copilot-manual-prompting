@@ -3,6 +3,12 @@
 CopilotSession keeps ONE Edge instance open and serves prompts one at a time
 from a dedicated worker thread (Playwright's sync API is thread-bound).
 
+Models: model_names() lists the models in Copilot's model picker, including
+models inside its sub-menus (read from the web UI at startup and every
+MODELS_REFRESH_MINUTES, or taken from config.MODELS). submit(..., model=name)
+selects that model in the picker - opening its sub-menu first if needed -
+before the prompt is sent; model=None keeps the current selection.
+
 Resuming: submit(..., resume={"url", "reply_hash", "prompt"}) reopens an
 existing Copilot chat and sends only resume["prompt"] (the new user message),
 after checking that the chat's last reply matches resume["reply_hash"]. If the
@@ -48,6 +54,7 @@ Future attributes set by the worker:
     answer_plain    the answer's cleaned page text (used to fingerprint the chat)
     chat_url        the Copilot conversation URL, if one was detected
     resumed         True if an existing chat was continued
+    model           the model shown in the picker when the reply finished
 """
 import difflib
 import logging
@@ -62,6 +69,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 import config
 from conversations import conversation_url, fingerprint, normalize
+from models import checkmark_key, option_name, picker_label
 
 log = logging.getLogger("copilot")
 
@@ -226,6 +234,48 @@ SNAPSHOT_JS = r"""
 }
 """
 
+# The model picker button: its aria-label ("Auto, Model Selector") and visible text.
+PICKER_JS = r"""
+sel => {
+  const b = document.querySelector(sel);
+  return b ? {aria: b.getAttribute('aria-label') || '', text: b.innerText || ''} : null;
+}
+"""
+
+# Whether any model menu is open.
+MENU_OPEN_JS = r"""
+sel => [...document.querySelectorAll(sel)].some(e => e.getClientRects().length > 0)
+"""
+
+# Tags an open model menu and returns its options.
+#   which = "main": the first visible menu (the picker's menu)
+#   which = "sub":  the last visible menu, if it isn't the main one (an open sub-menu); else null
+# The menu gets data-relay-menu=<which> and each option data-relay-opt=<index>, so the
+# option can be clicked by index afterwards.
+MENU_JS = r"""
+([menuSel, optSel, subSel, which]) => {
+  const vis = e => e.getClientRects().length > 0;
+  const menus = [...document.querySelectorAll(menuSel)].filter(vis);
+  if (!menus.length) return null;
+  const menu = which === 'main' ? menus[0] : menus[menus.length - 1];
+  if (which === 'sub' && (menus.length < 2 || menu.getAttribute('data-relay-menu') === 'main')) return null;
+  document.querySelectorAll('[data-relay-menu="' + which + '"]').forEach(m => m.removeAttribute('data-relay-menu'));
+  menu.setAttribute('data-relay-menu', which);
+  const opts = [...menu.querySelectorAll(optSel)].filter(o => o.closest(menuSel) === menu);
+  return opts.map((o, i) => {
+    o.setAttribute('data-relay-opt', String(i));
+    const c = o.querySelector('.fui-MenuItem__content');
+    const k = o.querySelector('svg[data-testid^="checkmark-"]');
+    let sub = false;
+    try { sub = !!(subSel && o.matches(subSel)); } catch (e) {}
+    return {content: c ? c.innerText : '', text: o.innerText || o.textContent || '',
+            checked: o.getAttribute('aria-checked') === 'true' || o.getAttribute('aria-selected') === 'true',
+            disabled: o.getAttribute('aria-disabled') === 'true',
+            submenu: sub, key: k ? k.getAttribute('data-testid').slice('checkmark-'.length) : ''};
+  });
+}
+"""
+
 
 # ---------------------------------------------------------------- markdown conversion
 _LANG_RE = re.compile(r"(?:language|lang)-([\w+#.-]+)")
@@ -387,13 +437,23 @@ def wrap_reasoning(reasoning: str) -> str:
     return think_open() + reasoning + think_close() if reasoning else ""
 
 
+def configured_models() -> list[str]:
+    return [m.strip() for m in config.MODELS.split(",") if m.strip()]
+
+
 class CopilotSession:
-    def __init__(self, show_window=False, markdown=True):
+    def __init__(self, show_window=False, markdown=True, discover_models=True):
         self.show_window = show_window
         self.markdown = markdown and _to_md is not None
+        self.discover_models = discover_models
         self._md_cache: dict[str, str] = {}
         self._warned_no_stop = False
         self._prompt_norm = ""            # your current prompt, normalized (to recognise its bubble)
+        self._models = {"names": configured_models(), "current": None, "fetched": 0.0,
+                        "source": "config" if configured_models() else "none",
+                        "paths": {}, "keys": {}}   # name -> sub-menu trigger names / internal key
+        self._models_lock = threading.Lock()
+        self._models_refresh: Future | None = None
         if _to_md is None:
             log.warning("markdownify is not installed - replies will be PLAIN TEXT with no formatting. "
                         "Run: pip install markdownify")
@@ -413,26 +473,58 @@ class CopilotSession:
     def result_timeout() -> float:
         """How long a caller should wait for one reply (queue wait not included)."""
         return (config.REPLY_TIMEOUT + config.START_TIMEOUT + config.INPUT_TIMEOUT
-                + config.RESUME_LOAD_TIMEOUT + 120)
+                + config.RESUME_LOAD_TIMEOUT + 2 * config.MODEL_TIMEOUT + 120)
 
-    def ask(self, prompt: str, timeout: float | None = None) -> str:
-        return self.submit(prompt).result(timeout=timeout or self.result_timeout())
+    def ask(self, prompt: str, timeout: float | None = None, model: str | None = None) -> str:
+        return self.submit(prompt, model=model).result(timeout=timeout or self.result_timeout())
 
-    def submit(self, prompt: str, on_delta=None, resume=None) -> Future:
+    def submit(self, prompt: str, on_delta=None, resume=None, model: str | None = None) -> Future:
         """Queue a prompt without blocking; returns a Future.
 
         on_delta(text) is called from the worker thread with each new piece
         of the reply while it is being written. Keep it fast (e.g. queue.put).
         resume={"url", "reply_hash", "prompt"} continues an existing chat (see module doc).
+        model: a name from model_names() to select first, or None to keep the current selection.
         """
         prompt = (prompt or "").strip()
         if not prompt:
             raise ValueError("Empty prompt provided.")
         fut: Future = Future()
         fut.streamed_text, fut.truncated, fut.answer_plain = "", False, ""
-        fut.chat_url, fut.resumed = None, False
-        self._q.put((prompt, fut, on_delta, resume))
+        fut.chat_url, fut.resumed, fut.model = None, False, None
+        self._q.put(("prompt", prompt, fut, on_delta, resume, model))
         return fut
+
+    def model_names(self, wait: float = 0.0) -> list[str]:
+        """Model names from the picker (or config.MODELS). Refreshes in the background when
+        stale; waits up to `wait` seconds if the list has never been read."""
+        with self._models_lock:
+            m = self._models
+            if m["source"] == "config":
+                return list(m["names"])
+            stale = time.time() - m["fetched"] > config.MODELS_REFRESH_MINUTES * 60
+            if stale and self.discover_models and (self._models_refresh is None or self._models_refresh.done()):
+                self._models_refresh = Future()
+                self._q.put(("models", self._models_refresh))
+            pending = self._models_refresh
+            never = not m["fetched"]
+        if never and wait and pending is not None:
+            try:
+                pending.result(timeout=wait)
+            except Exception:
+                pass
+        with self._models_lock:
+            return list(self._models["names"])
+
+    def model_keys(self) -> dict:
+        """{name: Copilot's internal key} for models whose option shows one (e.g. "Gpt_5_6_Chat")."""
+        with self._models_lock:
+            return dict(self._models["keys"])
+
+    @property
+    def current_model(self):
+        with self._models_lock:
+            return self._models["current"]
 
     @property
     def pending(self) -> int:
@@ -471,20 +563,28 @@ class CopilotSession:
         self._ready.set()
         log.info("Browser started (visible=%s, stream mode=%s, markdown=%s)",
                  self.show_window, self._stream_mode(), "on" if _to_md else "OFF")
+        if self.discover_models and self._models["source"] != "config":
+            self._refresh_models(page)
 
         try:
             while True:
                 item = self._q.get()
                 if item is None:
                     break
-                prompt, fut, on_delta, resume = item
+                if item[0] == "models":
+                    fut = item[1]
+                    if fut.set_running_or_notify_cancel():
+                        fut.set_result(self._refresh_models(page))
+                    continue
+                _, prompt, fut, on_delta, resume, model = item
                 if not fut.set_running_or_notify_cancel():
                     continue
                 try:
                     t0 = time.time()
-                    fut.set_result(self._ask(page, prompt, fut, on_delta, resume))
-                    log.info("Prompt answered in %.1fs%s", time.time() - t0,
-                             " (resumed chat)" if fut.resumed else "")
+                    fut.set_result(self._ask(page, prompt, fut, on_delta, resume, model))
+                    log.info("Prompt answered in %.1fs%s%s", time.time() - t0,
+                             " (resumed chat)" if fut.resumed else "",
+                             f" by model {fut.model!r}" if fut.model else "")
                 except Exception as e:
                     self._screenshot(page)
                     log.exception("Prompt failed")
@@ -529,6 +629,212 @@ class CopilotSession:
         if "/chat" not in page.url:
             page.goto(config.CHAT_URL, wait_until="domcontentloaded")
 
+    # ---------- model picker ----------
+    def _read_current_model(self, page):
+        try:
+            b = page.evaluate(PICKER_JS, config.MODEL_PICKER_SEL)
+        except Exception:
+            return None
+        name = picker_label(b.get("aria", ""), b.get("text", "")) if b else None
+        if name:
+            with self._models_lock:
+                self._models["current"] = name
+        return name
+
+    def _menu(self, page, which):
+        return page.evaluate(MENU_JS, [config.MODEL_MENU_SEL, config.MODEL_OPTION_SEL,
+                                       config.MODEL_SUBMENU_SEL, which])
+
+    def _wait_menu(self, page, which, timeout=None) -> list[dict] | None:
+        """Options of the main menu or the open sub-menu, waiting for them to render."""
+        deadline = time.time() + (timeout if timeout is not None else config.MODEL_TIMEOUT)
+        while True:
+            opts = self._menu(page, which)
+            if opts:
+                return opts
+            if time.time() > deadline:
+                return None
+            time.sleep(0.2)
+
+    def _click_option(self, page, which, idx):
+        page.locator(f'[data-relay-menu="{which}"] [data-relay-opt="{idx}"]').first.click(
+            timeout=config.MODEL_TIMEOUT * 1000)
+
+    def _open_model_menu(self, page) -> list[dict]:
+        """Open the picker and return the main menu's options (raw); raises CopilotError if it can't."""
+        self._close_menu(page)
+        try:
+            page.locator(config.MODEL_PICKER_SEL).first.click(timeout=config.MODEL_TIMEOUT * 1000)
+        except PWTimeout:
+            raise CopilotError("Could not click the model picker - check COPILOT_MODEL_PICKER_SEL.")
+        opts = self._wait_menu(page, "main")
+        if not opts:
+            raise CopilotError("The model menu did not open or had no options - check COPILOT_MODEL_MENU_SEL / "
+                               "COPILOT_MODEL_OPTION_SEL.")
+        return opts
+
+    def _open_submenu(self, page, idx) -> list[dict]:
+        """Open the sub-menu of main-menu option `idx` and return its options; raises CopilotError."""
+        loc = page.locator(f'[data-relay-menu="main"] [data-relay-opt="{idx}"]').first
+        attempts = (lambda: loc.click(timeout=config.MODEL_TIMEOUT * 1000),
+                    lambda: loc.hover(timeout=config.MODEL_TIMEOUT * 1000),
+                    lambda: (loc.focus(), page.keyboard.press("ArrowRight")))
+        for attempt in attempts:
+            try:
+                attempt()
+            except Exception:
+                continue
+            opts = self._wait_menu(page, "sub", timeout=config.MODEL_TIMEOUT / 3)
+            if opts:
+                return opts
+        raise CopilotError("A model sub-menu did not open - check COPILOT_MODEL_SUBMENU_SEL / "
+                           "COPILOT_MODEL_MENU_SEL.")
+
+    def _close_menu(self, page):
+        try:
+            for _ in range(3):
+                if not page.evaluate(MENU_OPEN_JS, config.MODEL_MENU_SEL):
+                    break
+                page.keyboard.press("Escape")
+                time.sleep(0.1)
+        except Exception:
+            pass
+
+    def _refresh_models(self, page) -> list[str]:
+        """Read the model list from the picker, including sub-menus. Never raises; keeps the old
+        list on failure."""
+        try:
+            if "/chat" not in (page.url or ""):
+                page.goto(config.CHAT_URL, wait_until="domcontentloaded")
+            self._ensure_signed_in(page)
+            page.locator(config.MODEL_PICKER_SEL).first.wait_for(state="visible",
+                                                                 timeout=config.MODEL_TIMEOUT * 3000)
+            current = self._read_current_model(page)
+            main = self._open_model_menu(page)
+            names, paths, keys, failed = [], {}, {}, []
+
+            def add(o, path):
+                n = option_name(o)
+                if n and n not in paths:
+                    names.append(n)
+                    paths[n] = path
+                    if checkmark_key(o):
+                        keys[n] = checkmark_key(o)
+
+            triggers = []
+            for i, o in enumerate(main):
+                if o.get("submenu"):
+                    triggers.append(option_name(o))
+                else:
+                    add(o, [])
+            for trigger in triggers:
+                try:
+                    main = self._open_model_menu(page)
+                    idx = next(i for i, o in enumerate(main) if option_name(o) == trigger)
+                    for o in self._open_submenu(page, idx):
+                        if not o.get("submenu"):
+                            add(o, [trigger])
+                except Exception as e:
+                    failed.append(f"{trigger} ({e})")
+            self._close_menu(page)
+            if not names:
+                raise CopilotError("The model menu had no options - check COPILOT_MODEL_OPTION_SEL.")
+            with self._models_lock:
+                self._models.update(names=names, paths=paths, keys=keys, fetched=time.time(), source="picker",
+                                    current=current or self._models["current"])
+            log.info("Models in the picker: %s (selected: %s)", ", ".join(
+                f"{' > '.join(paths[n] + [n])}" for n in names), current)
+            if failed:
+                log.warning("Could not read these model sub-menus: %s", "; ".join(failed))
+            return names
+        except Exception as e:
+            self._close_menu(page)
+            with self._models_lock:
+                self._models["fetched"] = time.time()   # don't retry on every request
+                names = list(self._models["names"])
+            log.warning("Could not read the model list from the picker (%s: %s). %s", type(e).__name__, e,
+                        "Keeping the previous list." if names else
+                        "Only 'm365-copilot' (current selection) will be listed; set COPILOT_MODELS to list "
+                        "models manually.")
+            return names
+
+    def _find_option(self, page, name, path):
+        """Open the menus along `path` and return (which menu, index, option) for `name`, or None.
+        Without a known path, searches the main menu and then every sub-menu."""
+        main = self._open_model_menu(page)
+        lname = name.lower()
+        if not path:
+            for i, o in enumerate(main):
+                if not o.get("submenu") and option_name(o).lower() == lname:
+                    return "main", i, o
+            if path is not None:           # known top-level model that isn't there
+                return None
+        triggers = [option_name(o) for o in main if o.get("submenu")] if not path else path[:1]
+        for trigger in triggers:
+            main = self._open_model_menu(page)
+            idx = next((i for i, o in enumerate(main) if option_name(o).lower() == trigger.lower()), None)
+            if idx is None:
+                continue
+            sub = self._open_submenu(page, idx)
+            for i, o in enumerate(sub):
+                if option_name(o).lower() == lname:
+                    return "sub", i, o
+        return None
+
+    def _is_selected(self, page, name, path) -> bool:
+        """Whether `name` is the selected model: the picker button shows its name, or (when the
+        button shows a shorter label) its option is checked in the menu."""
+        label = self._read_current_model(page)
+        if not label or normalize(label) not in normalize(name):
+            return False
+        with self._models_lock:
+            others = [n for n in self._models["names"] if n.lower() != name.lower()]
+        ambiguous = any(normalize(label) in normalize(o) for o in others)
+        if label.lower() == name.lower() and not ambiguous:
+            return True
+        # The label could mean several models (e.g. "Think deeper" for a sub-menu model): check the menu.
+        try:
+            found = self._find_option(page, name, path)
+            return bool(found and found[2].get("checked"))
+        finally:
+            self._close_menu(page)
+
+    def _select_model(self, page, name: str):
+        """Select `name` in the picker (opening its sub-menu if needed) unless it's already selected.
+        Raises CopilotError if it can't."""
+        with self._models_lock:
+            path = self._models["paths"].get(name)
+        if path is None:   # model list from COPILOT_MODELS or stale: search all menus
+            path = next((p for n, p in self._models["paths"].items() if n.lower() == name.lower()), None)
+        before = self._read_current_model(page)
+        if self._is_selected(page, name, path):
+            return
+        found = self._find_option(page, name, path)
+        if not found:
+            self._close_menu(page)
+            with self._models_lock:
+                listed = ", ".join(self._models["names"]) or "none found"
+            raise CopilotError(f"Model {name!r} is not in the model picker (listed: {listed}).")
+        which, idx, opt = found
+        if opt.get("disabled"):
+            self._close_menu(page)
+            raise CopilotError(f"Model {name!r} is disabled in the model picker.")
+        self._click_option(page, which, idx)
+        deadline = time.time() + config.MODEL_TIMEOUT
+        while time.time() < deadline:
+            label = self._read_current_model(page)
+            if label and label.lower() == name.lower():
+                break
+            if label and label != before and normalize(label) in normalize(name):
+                break                       # button shows a shorter label for this model
+            time.sleep(0.2)
+        self._close_menu(page)
+        if self._is_selected(page, name, path):
+            log.info("Selected model %r (was %r)", name, before)
+            return
+        raise CopilotError(f"Clicked model {name!r} but the picker still shows {self._read_current_model(page)!r}.")
+
+    # ---------- chats ----------
     def _open_existing(self, page, resume) -> bool:
         """Open a stored chat and check its last reply is the one we recorded.
 
@@ -564,7 +870,7 @@ class CopilotSession:
             return False
         return True
 
-    def _ask(self, page, prompt: str, fut: Future, on_delta=None, resume=None) -> str:
+    def _ask(self, page, prompt: str, fut: Future, on_delta=None, resume=None, model=None) -> str:
         resumed = False
         if resume:
             resumed = self._open_existing(page, resume)
@@ -589,6 +895,9 @@ class CopilotSession:
                 box.wait_for(state="visible", timeout=config.INPUT_TIMEOUT * 1000)
             else:
                 raise CopilotError("Chat input not found - selectors may need updating (see config.py).")
+
+        if model:
+            self._select_model(page, model)
 
         box.click()
         # Mark everything already in the chat so it can never be mistaken for the new reply.
@@ -626,6 +935,7 @@ class CopilotSession:
         # 2) wait for it to finish, streaming deltas if requested
         result = self._wait_for_completion(page, fut, on_delta)
         fut.chat_url = conversation_url(page.url)
+        fut.model = model or self._read_current_model(page)
         if not fut.chat_url:
             log.info("No conversation URL found after the reply (%s); this chat can't be resumed", page.url)
         return result
@@ -810,7 +1120,7 @@ class CopilotSession:
         return final
 
 
-def get_copilot_response(prompt_text, show_window=False):
+def get_copilot_response(prompt_text, show_window=False, model=None):
     """Backwards-compatible one-shot helper (starts and stops a browser)."""
-    with CopilotSession(show_window=show_window) as s:
-        return s.ask(prompt_text)
+    with CopilotSession(show_window=show_window, discover_models=False) as s:
+        return s.ask(prompt_text, model=model)

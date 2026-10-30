@@ -28,6 +28,32 @@ REASONING_SEL     = _env("COPILOT_REASONING_SEL",
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# Models
+# /v1/models lists the models in Copilot's model picker, read from the web UI.
+# A request's "model" selects that model in the picker before the prompt is sent.
+#   "m365-copilot"            -> keep whatever is currently selected
+#   "m365-copilot-<name>"     -> select <name>, e.g. m365-copilot-auto
+#   "<name>"                  -> also accepted, e.g. "Auto" (case-insensitive)
+MODEL_ID     = _env("COPILOT_MODEL_ID", "m365-copilot")   # id meaning "current selection"; prefix for the rest
+# Comma-separated model names. If set, these are listed INSTEAD of reading the picker
+# (use it to show only some models, or if reading the picker fails), e.g. "Auto,Quick response,Think deeper"
+MODELS       = _env("COPILOT_MODELS", "")
+MODELS_REFRESH_MINUTES = _env("COPILOT_MODELS_REFRESH_MINUTES", 60, float)  # re-read the picker this often
+# Unknown model names: 0 = use the current selection and log a warning (clients with
+# hard-coded names like "gpt-4o" keep working); 1 = reject with HTTP 400.
+STRICT_MODELS = _flag("COPILOT_STRICT_MODELS", "0")
+# The model picker button and its menu. From the picker's HTML (id="gptModeSwitcher").
+MODEL_PICKER_SEL = _env("COPILOT_MODEL_PICKER_SEL", "#gptModeSwitcher")
+MODEL_MENU_SEL   = _env("COPILOT_MODEL_MENU_SEL", '[role="menu"], [role="listbox"]')
+MODEL_OPTION_SEL = _env("COPILOT_MODEL_OPTION_SEL",
+                        '[role="menuitemradio"], [role="menuitemcheckbox"], [role="menuitem"], [role="option"]')
+# Options that open a sub-menu of more models (e.g. a "GPT-5.6 Sol" entry whose sub-menu holds
+# "GPT-5.6 Sol Quick response" and "GPT-5.6 Sol Think deeper"). Their models are listed too.
+MODEL_SUBMENU_SEL = _env("COPILOT_MODEL_SUBMENU_SEL",
+                         '[aria-haspopup="menu"], [aria-haspopup="true"], :has(> .fui-MenuItem__submenuIndicator)')
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Conversation resuming
 # When a request's earlier messages match a Copilot chat this server created,
 # that chat is reopened and only the new user message is sent.
@@ -77,6 +103,7 @@ START_TIMEOUT = _env("COPILOT_START_TIMEOUT", 120, int)   # wait for reasoning o
 REPLY_TIMEOUT = _env("COPILOT_REPLY_TIMEOUT", 600, int)   # hard cap per reply; hitting it -> finish_reason "length"
 LOGIN_TIMEOUT = _env("COPILOT_LOGIN_TIMEOUT", 300, int)   # manual sign-in with --show
 RESUME_LOAD_TIMEOUT = _env("COPILOT_RESUME_LOAD_TIMEOUT", 30, int)  # reopening an existing chat
+MODEL_TIMEOUT = _env("COPILOT_MODEL_TIMEOUT", 10, int)    # opening the model picker
 
 # Completion detection: a reply is finished when its text has not changed for
 STABLE_SECONDS         = _env("COPILOT_STABLE_SECONDS", 4, float)          # ...and the Stop button is gone
@@ -92,6 +119,5 @@ STREAM_POLL_INTERVAL = _env("COPILOT_STREAM_POLL_INTERVAL", 0.3, float)  # while
 # Server (local only)
 HOST     = _env("COPILOT_HOST", "127.0.0.1")
 PORT     = _env("COPILOT_PORT", 5000, int)
-MODEL_ID = _env("COPILOT_MODEL_ID", "m365-copilot")
 LOG_DIR  = _env("COPILOT_LOG_DIR", "./logs")
 MAX_PROMPT_CHARS = _env("COPILOT_MAX_PROMPT_CHARS", 200000, int)  # server-side sanity limit only

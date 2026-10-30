@@ -37,7 +37,6 @@ def test_code_block_keeps_language_and_underscores():
 
 
 def test_aria_roles_after_browser_normalization():
-    # What SNAPSHOT_JS produces from role="heading"/"table"/"row"/"cell" markup
     assert html_to_md("<h3>Summary</h3>") == "### Summary"
     md = html_to_md("<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>")
     assert "| A | B |" in md and "| 1 | 2 |" in md
@@ -66,7 +65,7 @@ def fast(monkeypatch):
 
 def new_future():
     f = Future()
-    f.streamed_text, f.truncated, f.answer_plain, f.chat_url, f.resumed = "", False, "", None, False
+    f.streamed_text, f.truncated, f.answer_plain, f.chat_url, f.resumed, f.model = "", False, "", None, False, None
     return f
 
 

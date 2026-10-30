@@ -1,5 +1,6 @@
 """Conversation store and chat reopening, no browser needed."""
 import os
+import sqlite3
 import sys
 import time
 
@@ -49,10 +50,25 @@ def test_history_key_robust_but_specific():
 def test_store_put_get_update(tmp_path):
     s = ConversationStore(str(tmp_path / "c.db"))
     assert s.get("k") is None
-    s.put("k", URL, 1, "h1")
-    assert s.get("k") == {"url": URL, "turns": 1, "reply_hash": "h1"}
+    s.put("k", URL, 1, "h1", "Auto")
+    assert s.get("k") == {"url": URL, "turns": 1, "reply_hash": "h1", "model": "Auto"}
     s.put("k", URL, 2, "h2")
-    assert s.get("k")["turns"] == 2 and len(s) == 1
+    assert s.get("k")["turns"] == 2 and s.get("k")["model"] is None and len(s) == 1
+
+
+def test_store_upgrades_old_database(tmp_path):
+    """A conversations.db created by v8-v10 has no model column."""
+    path = str(tmp_path / "old.db")
+    db = sqlite3.connect(path)
+    db.execute("""CREATE TABLE conversations (key TEXT PRIMARY KEY, chat_url TEXT NOT NULL, turns INTEGER NOT NULL,
+                  reply_hash TEXT NOT NULL, created REAL NOT NULL, last_used REAL NOT NULL)""")
+    db.execute("INSERT INTO conversations VALUES ('k', ?, 1, 'h', ?, ?)", (URL, time.time(), time.time()))
+    db.commit()
+    db.close()
+    s = ConversationStore(path)
+    assert s.get("k") == {"url": URL, "turns": 1, "reply_hash": "h", "model": None}
+    s.put("k2", URL, 1, "h", "Think deeper")
+    assert s.get("k2")["model"] == "Think deeper"
 
 
 def test_store_persists_and_prunes(tmp_path, monkeypatch):

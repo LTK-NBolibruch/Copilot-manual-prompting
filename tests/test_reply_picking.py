@@ -47,11 +47,8 @@ def test_norm_matches_python():
 
 
 def test_own_message_bubble_is_never_the_reply():
-    # only your bubble so far: no reply yet (v9 picked the bubble and could finish with it)
     assert pick([item("old reply", new=False), item(PROMPT)])["idx"] == -1
-    # bubble shown truncated / with a label
     assert pick([item("You said: " + PROMPT[:300])])["idx"] == -1
-    # then Copilot's reply appears after it
     assert pick([item("old", new=False), item(PROMPT), item("Headway is the time between trains.")]) == \
         {"idx": 2, "start": 2}
 
@@ -60,19 +57,15 @@ def test_short_resumed_prompt():
     p = normalize("Q2")
     assert pick([item("Q2")], p)["idx"] == -1
     assert pick([item("You Q2")], p)["idx"] == -1
-    # replies that restate a short prompt are still replies
     assert pick([item("Q2"), item("Q2 is about headway.")], p)["idx"] == 1
     assert pick([item("Q2 is about headway.")], p)["idx"] == 0
 
 
 def test_marked_old_replies_are_skipped():
-    # resumed chat: old replies are marked; nothing new yet -> no reply (v9 used counts and
-    # could pick the previous answer when lazily-loaded history raised the count)
     assert pick([item("older", new=False), item("previous answer", new=False)])["idx"] == -1
 
 
 def test_old_reply_rerendered_before_your_bubble_is_ignored():
-    # an old reply lost its mark (re-rendered) but sits before your bubble
     items = [item("previous answer"), item(PROMPT), item("New answer.")]
     assert pick(items)["idx"] == 2
     assert pick(items[:2])["idx"] == -1
@@ -85,12 +78,11 @@ def test_reasoning_and_user_containers_skipped():
 
 
 def test_new_chat_without_bubble_match():
-    # REPLY_SEL doesn't match your bubble at all: first new element is the reply
     assert pick([item("Answer starts")]) == {"idx": 0, "start": 0}
 
 
-def test_snapshot_js_is_valid_javascript():
-    from copilot import MARK_JS, SNAPSHOT_JS
-    for src in (SNAPSHOT_JS, MARK_JS):
+def test_browser_scripts_are_valid_javascript():
+    from copilot import MARK_JS, MENU_JS, MENU_OPEN_JS, PICKER_JS, SNAPSHOT_JS
+    for src in (SNAPSHOT_JS, MARK_JS, PICKER_JS, MENU_JS, MENU_OPEN_JS):
         subprocess.run([NODE, "-e", f"const f = {src}; if (typeof f !== 'function') process.exit(1);"],
                        check=True, capture_output=True)

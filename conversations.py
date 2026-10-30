@@ -1,10 +1,11 @@
 """Local store that maps OpenAI-style conversation histories to Copilot chats.
 
 Key   = hash of the conversation so far (every message, normalized).
-Value = the Copilot chat URL holding that conversation, its turn count, and a
-        hash of the last reply, used to check the chat is still in that state.
+Value = the Copilot chat URL holding that conversation, its turn count, a
+        hash of the last reply (used to check the chat is still in that
+        state) and the model the chat was started with.
 
-Only hashes and URLs are stored - no prompt or reply text (unless
+Only hashes, URLs and model names are stored - no prompt or reply text (unless
 COPILOT_LOG_CONVERSATIONS=1, which appends full text to logs/conversations.jsonl).
 
 Normalization makes matching robust to how clients store replies: reasoning
@@ -72,26 +73,31 @@ class ConversationStore:
         self.db = sqlite3.connect(self.path, check_same_thread=False)
         self.db.execute("""CREATE TABLE IF NOT EXISTS conversations (
                              key TEXT PRIMARY KEY, chat_url TEXT NOT NULL, turns INTEGER NOT NULL,
-                             reply_hash TEXT NOT NULL, created REAL NOT NULL, last_used REAL NOT NULL)""")
+                             reply_hash TEXT NOT NULL, created REAL NOT NULL, last_used REAL NOT NULL,
+                             model TEXT)""")
+        cols = [r[1] for r in self.db.execute("PRAGMA table_info(conversations)")]
+        if "model" not in cols:  # database created by v8-v10
+            self.db.execute("ALTER TABLE conversations ADD COLUMN model TEXT")
         self.db.commit()
         self.prune()
 
     def get(self, key):
         with self.lock:
-            row = self.db.execute("SELECT chat_url, turns, reply_hash FROM conversations WHERE key = ?",
+            row = self.db.execute("SELECT chat_url, turns, reply_hash, model FROM conversations WHERE key = ?",
                                   (key,)).fetchone()
             if row:
                 self.db.execute("UPDATE conversations SET last_used = ? WHERE key = ?", (time.time(), key))
                 self.db.commit()
-        return {"url": row[0], "turns": row[1], "reply_hash": row[2]} if row else None
+        return {"url": row[0], "turns": row[1], "reply_hash": row[2], "model": row[3]} if row else None
 
-    def put(self, key, chat_url, turns, reply_hash):
+    def put(self, key, chat_url, turns, reply_hash, model=None):
         now = time.time()
         with self.lock:
-            self.db.execute("""INSERT INTO conversations VALUES (?, ?, ?, ?, ?, ?)
+            self.db.execute("""INSERT INTO conversations (key, chat_url, turns, reply_hash, created, last_used, model)
+                               VALUES (?, ?, ?, ?, ?, ?, ?)
                                ON CONFLICT(key) DO UPDATE SET chat_url=excluded.chat_url, turns=excluded.turns,
-                               reply_hash=excluded.reply_hash, last_used=excluded.last_used""",
-                            (key, chat_url, turns, reply_hash, now, now))
+                               reply_hash=excluded.reply_hash, last_used=excluded.last_used, model=excluded.model""",
+                            (key, chat_url, turns, reply_hash, now, now, model))
             self.db.commit()
 
     def prune(self):
