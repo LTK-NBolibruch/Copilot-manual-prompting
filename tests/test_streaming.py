@@ -130,7 +130,7 @@ def make_session(markdown=False):
     s.markdown = markdown
     s._md_cache = {}
     s._warned_no_stop = False
-    s._r_before = 0
+    s._prompt_norm = ""
     return s
 
 
@@ -144,6 +144,7 @@ def fast(monkeypatch):
     monkeypatch.setattr(config, "REPLY_TIMEOUT", 5)
     monkeypatch.setattr(config, "THINK_TAG", "think")
     monkeypatch.setattr(config, "INCLUDE_REASONING", True)
+    monkeypatch.setattr(config, "DEBUG_REPLIES", False)
 
 
 def new_future():

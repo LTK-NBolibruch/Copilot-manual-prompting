@@ -104,7 +104,7 @@ class Handler(BaseHTTPRequestHandler):
     session: CopilotSession = None
     store: ConversationStore = None   # None = resuming disabled
     protocol_version = "HTTP/1.1"
-    server_version = "CopilotLocal/1.5"
+    server_version = "CopilotLocal/1.7"
 
     # ---------- helpers
     def _json(self, status, obj):
@@ -161,15 +161,19 @@ class Handler(BaseHTTPRequestHandler):
         return {**hit, "prompt": text_of(msgs[-1]["content"]).strip()}
 
     def _record(self, messages, fut, client_text, resume):
-        """Remember which Copilot chat now holds messages + this reply."""
-        reply = client_text or ""
-        log_conversation(messages, reply, getattr(fut, "chat_url", None), getattr(fut, "resumed", False))
-        if self.store is None or not getattr(fut, "chat_url", None) or not getattr(fut, "answer_plain", ""):
-            return
-        turns = resume["turns"] + 1 if getattr(fut, "resumed", False) else 1
-        history = clean_messages(messages)
-        self.store.put(history_key(history + [{"role": "assistant", "content": reply}]),
-                       fut.chat_url, turns, fingerprint(fut.answer_plain))
+        """Remember which Copilot chat now holds messages + this reply. Never raises: a failure
+        here must not stop the reply reaching the client."""
+        try:
+            reply = client_text or ""
+            log_conversation(messages, reply, getattr(fut, "chat_url", None), getattr(fut, "resumed", False))
+            if self.store is None or not getattr(fut, "chat_url", None) or not getattr(fut, "answer_plain", ""):
+                return
+            turns = resume["turns"] + 1 if getattr(fut, "resumed", False) and resume else 1
+            history = clean_messages(messages)
+            self.store.put(history_key(history + [{"role": "assistant", "content": reply}]),
+                           fut.chat_url, turns, fingerprint(fut.answer_plain))
+        except Exception:
+            log.exception("Could not record the conversation (the reply was still sent)")
 
     # ---------- methods
     def do_OPTIONS(self):
@@ -286,29 +290,32 @@ class Handler(BaseHTTPRequestHandler):
                   "choices": [{"index": 0, "delta": delta, "logprobs": None, "finish_reason": finish}]})
 
         first_token_at, sent = None, []
+        deadline = t0 + result_timeout() + 30
         try:
-            chunk({"role": "assistant", "content": ""})
-            while True:
-                try:
-                    item = events.get(timeout=KEEPALIVE_SECONDS)
-                except queue.Empty:
-                    # keep-alive comment so clients/proxies don't drop an idle connection
-                    self.wfile.write(b": keep-alive\n\n")
-                    self.wfile.flush()
-                    continue
-                if item is _DONE:
-                    break
-                if first_token_at is None:
-                    first_token_at = time.time()
-                sent.append(item)
-                chunk({"content": item})
+            try:
+                chunk({"role": "assistant", "content": ""})
+                while True:
+                    try:
+                        item = events.get(timeout=KEEPALIVE_SECONDS)
+                    except queue.Empty:
+                        if time.time() > deadline:
+                            raise TimeoutError("No end of reply from the browser worker in time.")
+                        if not self.session.alive:
+                            raise CopilotError("The browser worker stopped; restart the server.")
+                        # keep-alive comment so clients/proxies don't drop an idle connection
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+                        continue
+                    if item is _DONE:
+                        break
+                    if first_token_at is None:
+                        first_token_at = time.time()
+                    sent.append(item)
+                    chunk({"content": item})
 
-            exc = fut.exception()
-            if exc:
-                status, etype, code = error_status(exc)
-                log.warning("stream %s failed: %d %s: %s", cid, status, code, exc)
-                send({"error": {"message": str(exc), "type": etype, "param": None, "code": code}})
-            else:
+                exc = fut.exception(timeout=0) if fut.done() else TimeoutError("Reply did not finish.")
+                if exc:
+                    raise exc
                 # If nothing was streamed, send the whole reply at once.
                 if not sent and fut.result():
                     sent.append(fut.result())
@@ -324,6 +331,15 @@ class Handler(BaseHTTPRequestHandler):
                 log.info("stream %s %.1fs first-text=%s in=%d streamed=%d final=%d chars finish=%s %s",
                          cid, time.time() - t0, ttft, len(prompt), len(client_text), len(fut.result()), reason,
                          "resumed" if getattr(fut, "resumed", False) else "new-chat")
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                raise
+            except Exception as exc:  # anything else: tell the client, then end the stream properly
+                status, etype, code = error_status(exc)
+                if status == 500:
+                    log.exception("stream %s: unexpected error", cid)
+                else:
+                    log.warning("stream %s failed: %d %s: %s", cid, status, code, exc)
+                send({"error": {"message": str(exc), "type": etype, "param": None, "code": code}})
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):

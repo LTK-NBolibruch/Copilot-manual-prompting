@@ -39,6 +39,13 @@ LOG_CONVERSATIONS    = _flag("COPILOT_LOG_CONVERSATIONS", "0")                # 
                                                                               #     logs/conversations.jsonl
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Debugging
+# 1 = save every reply's HTML, the markdown produced from it and the page text to
+#     logs/replies/<time>.{html,md,txt}, to diagnose formatting problems.
+DEBUG_REPLIES = _flag("COPILOT_DEBUG_REPLIES", "0")
+# ---------------------------------------------------------------------------
+
 CHAT_URL        = _env("COPILOT_CHAT_URL", "https://m365.cloud.microsoft/chat/")
 PROFILE_DIR     = _env("COPILOT_PROFILE_DIR", "./playwright_profile")
 BROWSER_CHANNEL = _env("COPILOT_BROWSER_CHANNEL", "msedge")
@@ -49,6 +56,12 @@ REPLY_SEL   = _env("COPILOT_REPLY_SEL", '[data-testid="markdown-reply"], .fai-Ch
 SEND_SEL    = _env("COPILOT_SEND_SEL", 'button[title*="Submit"], button[aria-label*="Send"]')
 STOP_SEL    = _env("COPILOT_STOP_SEL", 'button[aria-label*="Stop"]')  # verify in DevTools
 POPOVER_SEL = _env("COPILOT_POPOVER_SEL", "button.fai-next, .fui-TeachingPopover button")
+# Your own messages in the chat. REPLY_SEL can also match them; anything inside these is never
+# treated as Copilot's reply. Best guess - verify in DevTools. (Your message is also recognised
+# by its text, so this is a second line of defence.)
+USER_MSG_SEL = _env("COPILOT_USER_MSG_SEL",
+                    '[data-testid*="user-message" i], [data-testid*="usermessage" i], '
+                    '[class*="userMessage" i], [data-author="user"], [data-message-author-role="user"]')
 # UI elements inside a reply that are not part of the answer (Copy buttons, icons, citation markers).
 # Removed before converting to markdown. Drop "sup" if you need superscripts in replies.
 NOISE_SEL   = _env("COPILOT_NOISE_SEL", "button, svg, sup")

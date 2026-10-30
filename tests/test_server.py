@@ -34,7 +34,7 @@ class FakeSession:
     def __init__(self):
         self.last_prompt, self.last_resume = None, None
         self.chats = {}            # url -> reply count
-        self.broken = set()        # urls that fail to reopen (simulates the page check failing)
+        self.broken = set()        # urls that fail to reopen
         self.n = 0
 
     def submit(self, prompt, on_delta=None, resume=None):
@@ -118,7 +118,6 @@ def stream_chunks(body):
 
 
 def chat(url, messages, stream=False):
-    """Send messages; return the assistant reply text as the client received it."""
     if stream:
         _, body = req(url, "POST", "/v1/chat/completions",
                       {"model": "m", "messages": messages, "stream": True}, raw=True)
@@ -296,7 +295,7 @@ def test_resume_sends_only_new_message(url):
     msgs += [{"role": "assistant", "content": a1}, {"role": "user", "content": "Q2"}]
     a2 = chat(url, msgs)
     assert fake.last_resume["url"] == first_url and fake.last_resume["prompt"] == "Q2"
-    assert fake.sent_prompt == "Q2"                          # system prompt not re-sent
+    assert fake.sent_prompt == "Q2"
     assert len(fake.chats) == 1 and fake.chats[first_url] == 2
 
     msgs += [{"role": "assistant", "content": a2}, {"role": "user", "content": "Q3"}]
@@ -309,7 +308,7 @@ def test_resume_tolerates_client_reformatting_reply(url):
     fake = server.Handler.session
     msgs = [SYSTEM, {"role": "user", "content": "Q1"}]
     a1 = chat(url, msgs)
-    reformatted = a1.split("</think>")[1].replace("**", "").strip() + "\n"   # client dropped think + bold
+    reformatted = a1.split("</think>")[1].replace("**", "").strip() + "\n"
     msgs += [{"role": "assistant", "content": reformatted}, {"role": "user", "content": "Q2"}]
     chat(url, msgs)
     assert fake.sent_prompt == "Q2"
@@ -349,12 +348,11 @@ def test_failed_reopen_falls_back_and_rerecords(url):
     fake = server.Handler.session
     msgs = [SYSTEM, {"role": "user", "content": "Q1"}]
     a1 = chat(url, msgs)
-    fake.broken.add(next(iter(fake.chats)))               # chat deleted / page check fails
+    fake.broken.add(next(iter(fake.chats)))
     msgs += [{"role": "assistant", "content": a1}, {"role": "user", "content": "Q2"}]
     a2 = chat(url, msgs)
     assert fake.last_resume is not None and "Conversation so far" in fake.sent_prompt
     assert len(fake.chats) == 2
-    # the next turn resumes the NEW chat
     msgs += [{"role": "assistant", "content": a2}, {"role": "user", "content": "Q3"}]
     chat(url, msgs)
     new_url = [u for u in fake.chats if u not in fake.broken][0]
@@ -390,3 +388,46 @@ def test_openai_sdk(url):
                   c.chat.completions.create(model="m", stream=True, messages=[{"role": "user", "content": "hi"}])
                   if ch.choices)
     assert out == "".join(PIECES)
+
+
+# ---------------------------------------------------------------- stream always finishes
+def test_stream_finishes_even_if_recording_fails(url, monkeypatch):
+    def broken_put(*a, **k):
+        raise RuntimeError("disk full")
+    monkeypatch.setattr(server.Handler.store, "put", broken_put)
+    s, body = req(url, "POST", "/v1/chat/completions", user("hi", stream=True), raw=True)
+    events = sse_events(body)
+    assert events[-1] == "[DONE]"
+    finishes = [json.loads(e)["choices"][0]["finish_reason"] for e in events[:-1] if json.loads(e).get("choices")]
+    assert finishes[-1] == "stop"
+
+
+def test_stream_ends_if_worker_never_finishes(url, monkeypatch):
+    class Stuck:
+        alive, pending = True, 0
+
+        def submit(self, prompt, on_delta=None, resume=None):
+            f = Future()
+            f.set_running_or_notify_cancel()
+            return f
+    server.Handler.session = Stuck()
+    monkeypatch.setattr(server, "KEEPALIVE_SECONDS", 0.05)
+    monkeypatch.setattr(server, "result_timeout", lambda: -29.8)   # deadline ~0.2 s after start
+    s, body = req(url, "POST", "/v1/chat/completions", user("hi", stream=True), raw=True)
+    events = sse_events(body)
+    assert events[-1] == "[DONE]" and json.loads(events[-2])["error"]["code"] == "timeout"
+
+
+def test_stream_ends_if_worker_dies(url, monkeypatch):
+    class Dead:
+        alive, pending = False, 0
+
+        def submit(self, prompt, on_delta=None, resume=None):
+            f = Future()
+            f.set_running_or_notify_cancel()
+            return f
+    server.Handler.session = Dead()
+    monkeypatch.setattr(server, "KEEPALIVE_SECONDS", 0.05)
+    s, body = req(url, "POST", "/v1/chat/completions", user("hi", stream=True), raw=True)
+    events = sse_events(body)
+    assert events[-1] == "[DONE]" and json.loads(events[-2])["error"]["code"] == "automation_failed"

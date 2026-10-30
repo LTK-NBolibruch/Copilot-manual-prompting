@@ -9,13 +9,25 @@ after checking that the chat's last reply matches resume["reply_hash"]. If the
 chat can't be opened or is in a different state (e.g. the client regenerated
 an earlier reply), a new chat is started with the full prompt instead.
 
+Finding the reply: before a prompt is sent, every reply and reasoning element
+already on the page is marked. Afterwards, only unmarked elements that come
+after the marked ones - and after your own message bubble, which is recognised
+by its text or USER_MSG_SEL - count as the new reply. (Counting elements was
+not reliable: your own message, lazily loaded chat history and re-rendered
+wrappers all change the count.)
+
+Formatting: the reply's HTML is cleaned in the browser (Copy buttons, icons,
+citation markers and reasoning removed; ARIA-role tables/lists/headings and
+inline-styled bold/italic turned into real HTML elements) and converted to
+markdown with markdownify.
+
 Streaming (submit(prompt, on_delta=callable)) has two modes, set by
 config.STREAM_MODE:
 
   markdown (default)
-      The reply's HTML is split into top-level blocks (paragraph, list, table,
-      code block, heading...). Every block except the last is finished, so it
-      is converted to markdown and sent. The block Copilot is still writing is
+      The reply is split into top-level blocks (paragraph, list, table, code
+      block, heading...). Every block except the last is finished, so it is
+      converted to markdown and sent. The block Copilot is still writing is
       held back until the next block starts or the reply ends.
 
   text
@@ -33,7 +45,7 @@ Future attributes set by the worker:
     result()        full reply (tagged reasoning + answer)
     streamed_text   exactly what was sent through on_delta
     truncated       True if the reply hit REPLY_TIMEOUT
-    answer_plain    the answer's plain page text (used to fingerprint the chat)
+    answer_plain    the answer's cleaned page text (used to fingerprint the chat)
     chat_url        the Copilot conversation URL, if one was detected
     resumed         True if an existing chat was continued
 """
@@ -41,6 +53,7 @@ import difflib
 import logging
 import os
 import queue
+import re
 import threading
 import time
 from concurrent.futures import Future
@@ -48,7 +61,7 @@ from concurrent.futures import Future
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 import config
-from conversations import conversation_url, fingerprint
+from conversations import conversation_url, fingerprint, normalize
 
 log = logging.getLogger("copilot")
 
@@ -81,29 +94,120 @@ def _on_login_page(page) -> bool:
     return _is_login_url(page.url)
 
 
-# Reads the last reply: reasoning text, the answer's plain text (for completion
-# detection) and the answer's top-level blocks as cleaned HTML (for markdown).
-SNAPSHOT_JS = r"""
-([sel, noise, rsel, rBefore]) => {
-  const pick = e => (e.innerText || '').trim() || (e.textContent || '').trim();  // collapsed panels: textContent
-  // Reasoning: matches added since the prompt was sent, outermost only.
-  let reasoning = '', rEls = [];
-  if (rsel) {
-    const all = [...document.querySelectorAll(rsel)].slice(rBefore);
-    rEls = all.filter(e => !all.some(o => o !== e && o.contains(e)));
-    reasoning = rEls.map(pick).filter(Boolean).join('\n\n');
+RELAY_MARK = "data-relay-old"
+
+# Pure helpers shared by SNAPSHOT_JS and the tests (tests run them in node).
+PICK_JS = r"""
+const relayNorm = s => (s || '').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+// Is normalized text c your own prompt p (normalized, possibly truncated) shown back in the chat?
+const relayIsEcho = (c, p) => {
+  if (!c || !p) return false;
+  if (c === p) return true;
+  if (p.length >= 20 && c.length >= 20) return c.includes(p.slice(0, 200)) || p.startsWith(c);
+  return c.endsWith(p) && c.length - p.length <= 12;      // short prompt with a label like "You said"
+};
+// items: reply-selector matches in document order: {isNew, inUser, inReasoning, n (normalized text)}.
+// Returns {idx: the new reply (-1 if none yet), start: first index after your own message bubble}.
+const relayPickReply = (items, p) => {
+  let start = 0;
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    if (it.isNew && (it.inUser || relayIsEcho(it.n, p))) { start = i + 1; break; }
   }
-  const m = document.querySelectorAll(sel);
-  if (!m.length) return {reasoning, text: '', blocks: []};
-  const el = m[m.length - 1];
-  // The last "reply" element is itself reasoning -> the answer hasn't started.
-  if (rsel && el.closest(rsel)) return {reasoning, text: '', blocks: []};
+  for (let i = items.length - 1; i >= start; i--) {
+    const it = items[i];
+    if (!it.isNew || it.inUser || it.inReasoning || relayIsEcho(it.n, p)) continue;
+    return {idx: i, start};
+  }
+  return {idx: -1, start};
+};
+"""
+
+# Marks every reply/reasoning element currently on the page as old.
+MARK_JS = r"""
+([sel, rsel, mark]) => {
+  const r = [...document.querySelectorAll(sel)];
+  r.forEach(e => e.setAttribute(mark, '1'));
+  const q = rsel ? [...document.querySelectorAll(rsel)] : [];
+  q.forEach(e => e.setAttribute(mark, '1'));
+  return {replies: r.length, reasoning: q.length};
+}
+"""
+
+# Reads the reply and returns:
+#   found     - whether a reply element was identified
+#   reasoning - reasoning text (sent in think tags)
+#   text      - the answer's visible text (completion detection, plain-text fallback)
+#   clean     - the answer's text without buttons/citations/reasoning (content check, chat fingerprint)
+#   blocks    - the answer's top-level blocks as cleaned, semantic HTML (markdown conversion)
+# o.newOnly: true while waiting for a new reply (marked elements and your own message are skipped);
+#            false to read the last reply already in a chat (reopening a stored conversation).
+SNAPSHOT_JS = r"""
+([sel, noise, rsel, usel, o]) => {
+  """ + PICK_JS + r"""
+  const MARK = o.mark, FOLLOWING = 4;
+  const pick = e => (e.innerText || '').trim() || (e.textContent || '').trim();  // collapsed panels: textContent
+  const after = (a, e) => !a || (!a.contains(e) && !!(a.compareDocumentPosition(e) & FOLLOWING));
+  const all = [...document.querySelectorAll(sel)];
+  const marked = all.filter(e => e.hasAttribute(MARK));
+  const lastOld = marked.length ? marked[marked.length - 1] : null;
+  const items = all.map(e => ({
+    isNew: !e.closest('[' + MARK + ']') && after(lastOld, e),
+    inUser: !!(usel && e.closest(usel)),
+    inReasoning: !!(rsel && e.closest(rsel)),
+    n: relayNorm(e.textContent),
+  }));
+
+  let el = null, reasoning = '', anchor = lastOld;
+  if (o.newOnly) {
+    const r = relayPickReply(items, o.prompt);
+    if (r.start > 0) anchor = all[r.start - 1];            // your own message bubble
+    if (r.idx >= 0) el = all[r.idx];
+    if (rsel) {
+      const rNew = [...document.querySelectorAll(rsel)].filter(e => !e.closest('[' + MARK + ']') && after(anchor, e));
+      reasoning = rNew.filter(e => !rNew.some(x => x !== e && x.contains(e))).map(pick).filter(Boolean).join('\n\n');
+    }
+  } else {
+    for (let i = all.length - 1; i >= 0 && !el; i--) if (!items[i].inUser && !items[i].inReasoning) el = all[i];
+  }
+  const res = {found: !!el, reasoning, text: '', clean: '', blocks: [], total: all.length, old: marked.length};
+  if (!el) return res;
+
   // Answer text without any reasoning nested inside the reply element.
   let text = el.innerText || '';
-  rEls.filter(r => el.contains(r)).forEach(r => { text = text.replace(r.innerText || '', ''); });
+  if (rsel) el.querySelectorAll(rsel).forEach(r => { const t = r.innerText || ''; if (t) text = text.replace(t, ''); });
+
   const c = el.cloneNode(true);
+  c.removeAttribute(MARK);
+  c.querySelectorAll('[' + MARK + ']').forEach(n => n.removeAttribute(MARK));
   if (noise) c.querySelectorAll(noise).forEach(n => n.remove());
   if (rsel) c.querySelectorAll(rsel).forEach(n => n.remove());
+
+  // Turn ARIA-role structure and inline-styled emphasis into real HTML, so the
+  // markdown conversion recognises them.
+  const swap = (n, tag) => {
+    if (n.tagName === tag.toUpperCase()) return;
+    const r = document.createElement(tag);
+    for (const a of ['class', 'colspan', 'rowspan']) if (n.hasAttribute(a)) r.setAttribute(a, n.getAttribute(a));
+    r.append(...n.childNodes);
+    n.replaceWith(r);
+  };
+  const unwrap = n => n.replaceWith(...n.childNodes);
+  const each = (q, f) => [...c.querySelectorAll(q)].forEach(f);
+  each('[role="heading"]', n => swap(n, 'h' + Math.min(6, Math.max(1, parseInt(n.getAttribute('aria-level')) || 3))));
+  each('[role="table"], [role="grid"]', n => swap(n, 'table'));
+  each('[role="rowgroup"]', unwrap);
+  each('[role="row"]', n => swap(n, 'tr'));
+  each('[role="columnheader"]', n => swap(n, 'th'));
+  each('[role="cell"], [role="gridcell"], [role="rowheader"]', n => swap(n, 'td'));
+  each('[role="list"]', n => swap(n, n.closest('ol') ? 'ol' : 'ul'));
+  each('[role="listitem"]', n => swap(n, 'li'));
+  each('span[style*="font-weight"]', n => {
+    const w = (n.style.fontWeight || '').toLowerCase();
+    if (w === 'bold' || w === 'bolder' || parseInt(w) >= 600) swap(n, 'strong');
+  });
+  each('span[style*="italic"]', n => swap(n, 'em'));
+
   // Descend through single-child wrapper divs to reach the real block list.
   const BLOCK = /^(P|UL|OL|TABLE|PRE|H[1-6]|BLOCKQUOTE|HR)$/;
   let root = c;
@@ -112,14 +216,37 @@ SNAPSHOT_JS = r"""
          !BLOCK.test(root.children[0].tagName)) {
     root = root.children[0];
   }
-  const blocks = [];
   root.childNodes.forEach(n => {
-    if (n.nodeType === 1) blocks.push(n.outerHTML);
-    else if (n.nodeType === 3 && n.textContent.trim()) blocks.push(n.textContent);
+    if (n.nodeType === 1) res.blocks.push(n.outerHTML);
+    else if (n.nodeType === 3 && n.textContent.trim()) res.blocks.push(n.textContent);
   });
-  return {reasoning, text: text.trim(), blocks};
+  res.text = text.trim();
+  res.clean = (c.textContent || '').trim();
+  return res;
 }
 """
+
+
+# ---------------------------------------------------------------- markdown conversion
+_LANG_RE = re.compile(r"(?:language|lang)-([\w+#.-]+)")
+
+
+def _code_language(el) -> str:
+    """Language for a fenced code block, from class="language-xxx" on <pre> or its <code>."""
+    nodes = [el] + list(el.find_all("code") if hasattr(el, "find_all") else [])
+    for n in nodes:
+        for cls in (n.get("class") or []):
+            m = _LANG_RE.match(cls)
+            if m:
+                return m.group(1)
+    return ""
+
+
+def html_to_md(html: str) -> str:
+    if not html.lstrip().startswith("<"):
+        return html.strip()
+    return _to_md(html, heading_style="ATX", bullets="-", escape_underscores=False,
+                  code_language_callback=_code_language).strip()
 
 
 # ---------------------------------------------------------------- text alignment
@@ -266,7 +393,12 @@ class CopilotSession:
         self.markdown = markdown and _to_md is not None
         self._md_cache: dict[str, str] = {}
         self._warned_no_stop = False
-        self._r_before = 0
+        self._prompt_norm = ""            # your current prompt, normalized (to recognise its bubble)
+        if _to_md is None:
+            log.warning("markdownify is not installed - replies will be PLAIN TEXT with no formatting. "
+                        "Run: pip install markdownify")
+        elif config.STREAM_MODE == "text":
+            log.warning("COPILOT_STREAM_MODE=text - streamed replies will be plain text with no formatting.")
         self._q: "queue.Queue" = queue.Queue()
         self._ready = threading.Event()
         self._startup_error = None
@@ -337,7 +469,8 @@ class CopilotSession:
             self._ready.set()
             return
         self._ready.set()
-        log.info("Browser started (visible=%s, stream mode=%s)", self.show_window, self._stream_mode())
+        log.info("Browser started (visible=%s, stream mode=%s, markdown=%s)",
+                 self.show_window, self._stream_mode(), "on" if _to_md else "OFF")
 
         try:
             while True:
@@ -420,7 +553,7 @@ class CopilotSession:
         # Let the chat finish rendering, then compare its last reply.
         prev, deadline = None, time.time() + 10
         while time.time() < deadline:
-            _, text, _ = self._snapshot(page)
+            text = self._snapshot(page, new_only=False)["clean"]
             if text and text == prev:
                 break
             prev = text
@@ -458,8 +591,11 @@ class CopilotSession:
                 raise CopilotError("Chat input not found - selectors may need updating (see config.py).")
 
         box.click()
-        before = page.locator(config.REPLY_SEL).count()
-        self._r_before = page.locator(config.REASONING_SEL).count() if config.REASONING_SEL else 0
+        # Mark everything already in the chat so it can never be mistaken for the new reply.
+        marked = page.evaluate(MARK_JS, [config.REPLY_SEL, config.REASONING_SEL, RELAY_MARK]) or {}
+        self._prompt_norm = normalize(prompt)[:2000]
+        log.debug("Marked %s existing reply and %s reasoning element(s)", marked.get("replies"),
+                  marked.get("reasoning"))
         page.keyboard.insert_text(prompt)  # whole prompt at once, still fires input events
         page.wait_for_timeout(500)
         # Copilot's chat box has its own character limit and silently cuts off longer input.
@@ -476,16 +612,16 @@ class CopilotSession:
             config.SEND_SEL,
         )
 
-        # 1) wait for a NEW reply bubble, or for Copilot to start reasoning
-        try:
-            page.wait_for_function(
-                "([sel, n, rsel, rn]) => document.querySelectorAll(sel).length > n ||"
-                " (rsel && document.querySelectorAll(rsel).length > rn)",
-                arg=[config.REPLY_SEL, before, config.REASONING_SEL, self._r_before],
-                timeout=config.START_TIMEOUT * 1000,
-            )
-        except PWTimeout:
-            raise CopilotError("Copilot did not start replying in time.")
+        # 1) wait for the NEW reply (or Copilot's reasoning) to appear
+        deadline = time.time() + config.START_TIMEOUT
+        while True:
+            snap = self._snapshot(page)
+            if snap["found"] or snap["reasoning"]:
+                break
+            if time.time() > deadline:
+                raise CopilotError("Copilot did not start replying in time (no new reply found after your "
+                                   "message - check COPILOT_REPLY_SEL).")
+            time.sleep(0.25)
 
         # 2) wait for it to finish, streaming deltas if requested
         result = self._wait_for_completion(page, fut, on_delta)
@@ -495,17 +631,20 @@ class CopilotSession:
         return result
 
     # ---------- reply reading ----------
-    def _snapshot(self, page) -> tuple[str, str, list[str]]:
-        """(reasoning text, answer text, answer blocks as HTML)."""
-        snap = page.evaluate(SNAPSHOT_JS, [config.REPLY_SEL, config.NOISE_SEL,
-                                           config.REASONING_SEL, self._r_before])
-        return snap.get("reasoning") or "", snap.get("text") or "", snap.get("blocks") or []
+    def _snapshot(self, page, new_only=True) -> dict:
+        """{found, reasoning, text, clean, blocks} for the reply (see SNAPSHOT_JS)."""
+        snap = page.evaluate(SNAPSHOT_JS, [config.REPLY_SEL, config.NOISE_SEL, config.REASONING_SEL,
+                                           config.USER_MSG_SEL,
+                                           {"newOnly": new_only, "prompt": self._prompt_norm,
+                                            "mark": RELAY_MARK}]) or {}
+        text = snap.get("text") or ""
+        return {"found": snap.get("found", bool(text)), "reasoning": snap.get("reasoning") or "",
+                "text": text, "clean": snap.get("clean") or text, "blocks": snap.get("blocks") or []}
 
     def _block_md(self, html: str) -> str:
         md = self._md_cache.get(html)
         if md is None:
-            md = _to_md(html, heading_style="ATX", bullets="-").strip() if html.lstrip().startswith("<") \
-                else html.strip()
+            md = html_to_md(html)
             if len(self._md_cache) > 2000:
                 self._md_cache.clear()
             self._md_cache[html] = md
@@ -523,17 +662,38 @@ class CopilotSession:
         except Exception:  # never let a client problem kill the worker
             log.exception("on_delta callback failed")
 
-    def _final_text(self, plain: str, blocks_html: list[str], use_md: bool) -> str:
-        """Markdown of the whole reply, falling back to plain text if the
-        conversion lost content (e.g. a block the snapshot script missed)."""
+    def _final_text(self, plain: str, clean: str, blocks_html: list[str], use_md: bool) -> str:
+        """Markdown of the whole reply. Falls back to plain text only if the
+        conversion clearly lost content compared with the cleaned reply text
+        (the same text the markdown was made from, minus buttons/citations)."""
         if not use_md:
             return plain
         md = BlockStreamer.SEP.join(self._blocks_md(blocks_html))
-        if _alnum_count(md) < 0.9 * _alnum_count(plain) - 60:
-            log.warning("Markdown conversion has %d of %d letters/digits of the reply - using plain text. "
-                        "Check COPILOT_NOISE_SEL / the reply HTML.", _alnum_count(md), _alnum_count(plain))
+        if not md:
             return plain
-        return md or plain
+        have, want = _alnum_count(md), _alnum_count(clean)
+        if have < 0.8 * want - 60:
+            log.warning("Markdown conversion has %d of %d letters/digits of the reply - using plain text. "
+                        "Set COPILOT_DEBUG_REPLIES=1 and send logs/replies/ to diagnose.", have, want)
+            return plain
+        return md
+
+    def _debug_dump(self, blocks_html, answer, plain):
+        if not config.DEBUG_REPLIES:
+            return
+        try:
+            d = os.path.join(config.LOG_DIR, "replies")
+            os.makedirs(d, exist_ok=True)
+            stem = os.path.join(d, time.strftime("%Y%m%d-%H%M%S"))
+            with open(stem + ".html", "w", encoding="utf-8") as f:
+                f.write("\n<!-- block -->\n".join(blocks_html))
+            with open(stem + ".md", "w", encoding="utf-8") as f:
+                f.write(answer)
+            with open(stem + ".txt", "w", encoding="utf-8") as f:
+                f.write(plain)
+            log.info("Saved reply debug files: %s.{html,md,txt}", stem)
+        except Exception:
+            log.exception("Could not save reply debug files")
 
     def _wait_for_completion(self, page, fut: Future, on_delta=None) -> str:
         streaming = on_delta is not None
@@ -541,7 +701,7 @@ class CopilotSession:
         interval = config.STREAM_POLL_INTERVAL if streaming else config.POLL_INTERVAL
         with_reasoning = config.INCLUDE_REASONING and bool(config.REASONING_SEL)
         tracker, blocks = DeltaTracker(), BlockStreamer()
-        last_text, last_blocks, last_reasoning = None, [], None
+        last = {"reasoning": None, "text": None, "clean": "", "blocks": []}
         reasoning_best, r_sent = "", ""          # longest reasoning seen / reasoning streamed
         think = "none"                           # none -> open -> closed
         stop_seen, ended = False, "timeout"
@@ -559,9 +719,10 @@ class CopilotSession:
                 think = "closed"
 
         while time.time() < deadline:
-            reasoning, text, blocks_html = self._snapshot(page)
+            snap = self._snapshot(page)
+            reasoning, text, blocks_html = snap["reasoning"], snap["text"], snap["blocks"]
             now = time.time()
-            if text != last_text or reasoning != last_reasoning:
+            if text != last["text"] or reasoning != last["reasoning"]:
                 last_change = now
             if len(reasoning) > len(reasoning_best):
                 reasoning_best = reasoning      # panels may collapse/shrink once done
@@ -585,7 +746,7 @@ class CopilotSession:
             generating = page.locator(config.STOP_SEL).count() > 0
             stop_seen = stop_seen or generating
             idle = now - last_change
-            last_text, last_blocks, last_reasoning = text, blocks_html, reasoning
+            last = snap
 
             if text:
                 if not generating and idle >= (config.STABLE_SECONDS if stop_seen
@@ -599,7 +760,7 @@ class CopilotSession:
                     break
             time.sleep(interval)
 
-        if not last_text:
+        if not last["text"]:
             raise CopilotError("Timed out waiting for Copilot's reply.")
         if ended == "timeout":
             fut.truncated = True
@@ -611,10 +772,11 @@ class CopilotSession:
                         "Waiting %ss of no change instead of %ss to decide a reply is finished.",
                         config.STABLE_SECONDS_NO_STOP, config.STABLE_SECONDS)
 
-        plain = (last_text or "").strip()
-        fut.answer_plain = plain
+        plain = (last["text"] or "").strip()
+        fut.answer_plain = (last["clean"] or plain).strip()
         use_md = (self.markdown or mode == "markdown") and _to_md is not None and mode != "text"
-        answer = self._final_text(plain, last_blocks, use_md)
+        answer = self._final_text(plain, last["clean"], last["blocks"], use_md)
+        self._debug_dump(last["blocks"], answer, plain)
         reasoning_final = reasoning_best.strip() if with_reasoning else ""
         final = wrap_reasoning(reasoning_final) + answer
 

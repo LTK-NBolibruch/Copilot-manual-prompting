@@ -11,7 +11,7 @@ OpenAI client ──▶ http://127.0.0.1:5000/v1 ──queue──▶ one Edge s
 ## Setup
 
 ```powershell
-pip install -r requirements.txt
+pip install -r requirements.txt        # includes markdownify, needed for formatted replies
 python ask.py --show "Reply with OK"   # one-time sign-in (saved in .\playwright_profile)
 python server.py                       # http://127.0.0.1:5000/v1
 ```
@@ -48,6 +48,46 @@ for chunk in client.chat.completions.create(model="m365-copilot", stream=True,
 | GET | `/v1/models/{id}` | Echoes any id, so hard-coded model names work |
 | GET | `/health` | Worker status, queue depth and number of stored conversations |
 
+## Formatting (markdown)
+
+Replies are returned as markdown: headings, bold and italics, lists, tables, links and fenced code blocks with their language.
+
+**How it works:**
+
+1. **Clean up the reply in the browser.** Copy buttons, icons, citation markers (`COPILOT_NOISE_SEL`) and the reasoning section are removed.
+2. **Convert Copilot's own markup.** Tables, lists and headings that Copilot builds from `<div role="table">`, `role="row"`, `role="heading"` and similar elements are turned into real HTML tables, lists and headings. Text made bold or italic with inline styles is turned into `<strong>` and `<em>`.
+3. **Convert to markdown.** `markdownify` converts the result. Underscores aren't escaped, so identifiers like `run_sdr` and `trip_id` come through unchanged.
+
+**Plain-text safety net.** If the markdown has much less text than the cleaned reply (less than 80%), the server assumes the conversion lost content. It sends the plain page text instead and logs `Markdown conversion has N of M letters/digits`. In v6–v8 this check compared against the page text *including* buttons and source lists, so most replies failed it and came back unformatted. It now compares like with like.
+
+**If replies are still unformatted:**
+
+- **Check the startup log.** It should say `markdown=on`. If you see `markdownify is not installed`, run `pip install markdownify`.
+- **Look for the safety-net warning.** If `logs/server.log` shows `Markdown conversion has N of M`, the conversion is still losing text.
+- **Capture a reply for diagnosis.** Set `COPILOT_DEBUG_REPLIES=1`, send one prompt, and look in `logs/replies/`. Each reply is saved as:
+  - `.html`: the cleaned HTML that was converted
+  - `.md`: the markdown produced from it
+  - `.txt`: the page text
+  
+  Comparing those shows where the formatting is lost. They contain the reply text, so delete them when you're done.
+
+## Finding the new reply
+
+To read Copilot's answer, the server has to pick the right element on the page. A chat page holds your own messages, earlier replies, and, in a resumed chat, history that may still be loading.
+
+1. **Mark what's already there.** Just before sending a prompt, every reply and reasoning element already on the page is marked as old.
+2. **Find your own message.** After sending, your own message bubble is recognised by its text, or by `COPILOT_USER_MSG_SEL`. It's never treated as the reply.
+3. **Pick the reply.** Only an unmarked element that comes **after** the old replies and after your message counts as the new reply.
+4. **Wait for it.** The server waits until that element, or Copilot's reasoning, appears before it starts reading. If it never appears, the request fails after `COPILOT_START_TIMEOUT` with a message pointing at `COPILOT_REPLY_SEL`.
+
+Before v10, the server instead waited for the *number* of reply elements to go up and then read the last one. Several things raised that number before Copilot replied: your own message bubble, older history loading into a resumed chat, and wrapper elements being re-rendered. The server then streamed the wrong text (your prompt or the previous answer) and could treat it as finished before the real answer arrived. It also recorded the wrong reply for conversation resuming.
+
+**Streams always end properly.** A streamed response always finishes with a final chunk (or an error event) and `data: [DONE]`, even if:
+
+- recording the conversation fails
+- the browser worker stops
+- no reply arrives within the time limits
+
 ## Resuming conversations
 
 OpenAI clients send the whole conversation with every request. Instead of starting a new Copilot chat each time and pasting that history in, the server **continues the Copilot chat that already holds the conversation** and sends only the new user message.
@@ -74,13 +114,14 @@ OpenAI clients send the whole conversation with every request. Instead of starti
 
 | Setting | Default | Purpose |
 |---|---|---|
-| `COPILOT_RESUME_CONVERSATIONS` | `1` | Set to `0` to start every request in a new chat (the old behaviour) |
+| `COPILOT_RESUME_CONVERSATIONS` | `1` | Set to `0` to start every request in a new chat |
 | `COPILOT_CONVERSATION_DB` | `./conversations.db` | Where the records are stored |
 | `COPILOT_CONVERSATION_TTL_DAYS` | `30` | Records unused this long are deleted at startup |
 | `COPILOT_MAX_TURNS` | `30` | Turns per Copilot chat before starting a new one |
 | `COPILOT_RESUME_LOAD_TIMEOUT` | `30` | Seconds to wait for a reopened chat to load |
 | `COPILOT_LOG_CONVERSATIONS` | `0` | Set to `1` to also append the full prompts and replies to `logs/conversations.jsonl`, for debugging |
 
+- **After upgrading to v10.** Chats recorded by v9 or earlier won't resume, because the reply fingerprint is now taken from the cleaned reply text. Each such conversation starts one new chat, then resumes normally.
 - **What's stored.** `conversations.db` holds only hashes, chat URLs and turn counts, no prompt or reply text. It's listed in `.gitignore`. Delete it at any time to forget all chats.
 - **The log.** Each request is logged as `resumed` or `new-chat` in `logs/server.log`, along with the reason when a stored chat couldn't be continued.
 
@@ -122,19 +163,15 @@ Streaming is **live**: text is sent to the client while Copilot is still writing
 
 ### `markdown` (default): finished blocks, as markdown
 
-1. While Copilot writes, the worker reads the reply's HTML every `COPILOT_STREAM_POLL_INTERVAL` seconds (default 0.3) and splits it into top-level blocks: paragraphs, headings, lists, tables and code blocks.
+1. While Copilot writes, the worker reads the reply every `COPILOT_STREAM_POLL_INTERVAL` seconds (default 0.3) and splits it into top-level blocks: paragraphs, headings, lists, tables and code blocks.
 2. Every block except the last is finished, so it is converted to markdown and sent.
 3. The block Copilot is still writing is held back until the next block starts or the reply ends.
 
-Copilot's re-rendering (raw `**` turning into bold, tables and code blocks forming) happens inside that unfinished block, so a markdown-rendering client can render the stream as it arrives.
-
-- **Text arrives a block at a time.** A long paragraph or a big table appears all at once when it's finished.
-- **Noise is removed first.** Copy buttons, icons and citation superscripts are stripped before conversion (`COPILOT_NOISE_SEL`).
-- **Needs `markdownify`.** Without it, the server falls back to `text` mode.
+Copilot's re-rendering (raw `**` turning into bold, tables and code blocks forming) happens inside that unfinished block, so a markdown-rendering client can render the stream as it arrives. Text arrives a block at a time, so a long paragraph or a big table appears all at once when it's finished.
 
 ### `text`: plain text as it's typed
 
-Sends plain text word by word, with no formatting. Sending pauses whenever Copilot reformats text that was already sent.
+Sends plain text word by word, with **no formatting**. Sending pauses whenever Copilot reformats text that was already sent.
 
 ### Nothing is lost at the end
 
@@ -149,7 +186,6 @@ When the reply finishes, the server always sends whatever the client hasn't rece
 - **End of stream.** The final chunk has `finish_reason` `"stop"`, or `"length"` if the hard limit was hit, followed by `data: [DONE]`. Keep-alive comments go out every 10 s while nothing new arrives.
 - **Errors arrive in the stream.** Once streaming has started, an error is sent as an `{"error": {...}}` event followed by `[DONE]`.
 - **Same output with or without streaming.** Non-streamed replies use the same markdown conversion.
-- **Safety net for missed content.** If the markdown conversion contains noticeably less text than the page shows, the server uses the page's plain text instead and logs a warning. Check `COPILOT_NOISE_SEL` if you see that warning.
 
 ## How OpenAI features map onto Copilot
 
@@ -188,5 +224,5 @@ python ask.py -i --stream              # interactive, streamed
 - **Client timeouts.** Set the client timeout above `COPILOT_REPLY_TIMEOUT` (600 s). The OpenAI SDK's default is also 600 s, so raise it or lower the server limit.
 - **Logs.** `logs/server.log` records each request, whether it resumed a chat, and how each reply ended (`stable`, `stuck` or `timeout`). For streamed replies it also records how long until the first text arrived and how much was streamed versus the final reply.
 - **Re-sign-in.** Stop the server, run `python ask.py --show "Reply with OK"`, then start it again.
-- **Settings.** Selectors, timeouts, poll intervals, stream mode, reasoning tags, conversation resuming, port and model name are in `config.py`, and each can be overridden with a `COPILOT_*` environment variable.
-- **Tests.** Run `pytest -q`. The browser is mocked; reply reading, streaming and chat resuming are tested against simulated Copilot pages. The browser-side scripts have not been tested against the real page.
+- **Settings.** Selectors, timeouts, poll intervals, stream mode, reasoning tags, conversation resuming, debugging and port and model name are in `config.py`, and each can be overridden with a `COPILOT_*` environment variable.
+- **Tests.** Run `pytest -q`. The browser is mocked; reply reading, formatting, streaming and chat resuming are tested against simulated Copilot pages. The reply-picking logic runs in Node, which is skipped if `node` isn't installed. The browser-side scripts have not been tested against the real page.

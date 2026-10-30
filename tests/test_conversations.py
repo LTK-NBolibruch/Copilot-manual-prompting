@@ -2,7 +2,6 @@
 import os
 import sys
 import time
-from concurrent.futures import Future
 
 import pytest
 from playwright.sync_api import TimeoutError as PWTimeout
@@ -43,7 +42,6 @@ def test_history_key_robust_but_specific():
     assert history_key(a) == history_key(b)
     assert history_key(a) != history_key(a[:-1] + [{"role": "assistant", "content": "A2"}])
     assert history_key(a) != history_key([{"role": "system", "content": "Be verbose."}] + a[1:])
-    # same text, different roles -> different keys
     assert history_key([{"role": "user", "content": "x"}]) != history_key([{"role": "assistant", "content": "x"}])
 
 
@@ -66,14 +64,12 @@ def test_store_persists_and_prunes(tmp_path, monkeypatch):
     s.db.commit()
     s.close()
     monkeypatch.setattr(config, "CONVERSATION_TTL_DAYS", 30)
-    s2 = ConversationStore(path)                 # prunes on open
+    s2 = ConversationStore(path)
     assert s2.get("new") and s2.get("old") is None
 
 
 # ---------------------------------------------------------------- reopening a chat
 class NavPage:
-    """Minimal page for _open_existing."""
-
     def __init__(self, last_reply, landed=None, load_error=None):
         self.last_reply, self.landed, self.load_error = last_reply, landed, load_error
         self.url = "about:blank"
@@ -94,7 +90,7 @@ class NavPage:
 
 def session():
     s = CopilotSession.__new__(CopilotSession)
-    s.show_window, s._r_before = False, 0
+    s.show_window, s._prompt_norm = False, ""
     return s
 
 
@@ -107,7 +103,6 @@ def test_open_existing_matches():
 
 
 def test_open_existing_chat_moved_on():
-    # client regenerated / chat has a later reply than the one we recorded
     assert session()._open_existing(NavPage("A different, later reply."), resume_for("Headway is 120 s")) is False
 
 
