@@ -1,4 +1,4 @@
-"""Command-line use without any server.
+"""Command-line use without any server. Each prompt starts a new Copilot chat.
 
   python ask.py "What is a flaky test?"
   type log.txt | python ask.py --prefix "Summarize these failures:"

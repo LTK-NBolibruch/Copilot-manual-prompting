@@ -1,7 +1,7 @@
 """Reply-reading and streaming tests against a simulated Copilot page (no browser needed).
 
 The browser-side SNAPSHOT_JS is not executed here; FakePage returns the
-{text, blocks} snapshots it would produce.
+{reasoning, text, blocks} snapshots it would produce.
 """
 import os
 import sys
@@ -21,15 +21,13 @@ needs_md = pytest.mark.skipif(copilot._to_md is None, reason="markdownify not in
 def test_extend_exact_and_formatting_insensitive():
     assert extend("", "abc") == "abc"
     assert extend("Hello", "Hello world") == " world"
-    assert extend("One", "One changed") == " changed"                 # same words, more text
+    assert extend("One", "One changed") == " changed"
     assert extend("Time between trains.", "Time between **trains**. Next") == " Next"
     assert extend("Hello world", "Goodbye") is None
 
 
 def test_remainder_after_rewrite_of_sent_text():
-    # an already-sent block got a citation inserted; only the new tail is sent
     assert remainder("One\n\nTwo", "One with citation\n\nTwo\n\nThree") == "\n\nThree"
-    # plain-text stream vs markdown final: nothing duplicated
     assert remainder("Col A Col B 1 2", "| Col A | Col B |\n|---|---|\n| 1 | 2 |\n\nAfter table") == "\n\nAfter table"
     assert remainder("Same", "Same") == ""
 
@@ -87,7 +85,8 @@ class FakeLocator:
 class FakePage:
     """Each evaluate() returns the next snapshot; the last one repeats.
 
-    A snapshot is a list of HTML blocks, or a plain string.
+    A snapshot is a list of HTML blocks, a plain string, or
+    {"reasoning": str, "answer": str or [blocks]}.
     generating_until: number of polls during which the Stop button is visible.
     """
 
@@ -100,7 +99,7 @@ class FakePage:
         snap = self.snapshots[min(self.i, len(self.snapshots) - 1)]
         self.generating = self.i < self.generating_until
         self.i += 1
-        if isinstance(snap, dict):           # {"reasoning": str, "answer": str or [blocks]}
+        if isinstance(snap, dict):
             ans = snap.get("answer", "")
             blocks = ans if isinstance(ans, list) else ([f"<p>{ans}</p>"] if ans else [])
             text = "\n".join(ans) if isinstance(ans, list) else ans
@@ -143,18 +142,15 @@ def fast(monkeypatch):
     monkeypatch.setattr(config, "STABLE_SECONDS_NO_STOP", 0.2)
     monkeypatch.setattr(config, "STUCK_SECONDS", 1.0)
     monkeypatch.setattr(config, "REPLY_TIMEOUT", 5)
+    monkeypatch.setattr(config, "THINK_TAG", "think")
+    monkeypatch.setattr(config, "INCLUDE_REASONING", True)
 
 
 def new_future():
     f = Future()
-    f.streamed_text, f.truncated = "", False
+    f.streamed_text, f.truncated, f.answer_plain = "", False, ""
+    f.chat_url, f.resumed = None, False
     return f
-
-
-@pytest.fixture(autouse=True)
-def default_tags(monkeypatch):
-    monkeypatch.setattr(config, "THINK_TAG", "think")
-    monkeypatch.setattr(config, "INCLUDE_REASONING", True)
 
 
 def run(page, mode, monkeypatch, markdown=False):
@@ -198,7 +194,6 @@ def test_markdown_non_streaming_same_output(monkeypatch):
 
 @needs_md
 def test_markdown_tail_sent_when_block_structure_collapses(monkeypatch):
-    """Copilot wraps the finished reply in one container: the last block must still arrive."""
     snaps = [["<p>Alpha one</p>", "<p>Beta two</p>", "<p>Gamma thr"],
              ["<p>Alpha one</p>", "<p>Beta two</p>", "<p>Gamma three</p>", "<p>Delta"],
              ["<div><p>Alpha one</p><p>Beta two</p><p>Gamma three</p><p>Delta four, the end.</p></div>"]]
@@ -225,7 +220,7 @@ def test_markdown_conversion_losing_content_falls_back_to_plain(monkeypatch):
             self.i += 1
             self.generating = False
             text = "Intro paragraph. " + "Important detail that must not be lost. " * 10
-            return {"text": text, "blocks": ["<p>Intro paragraph.</p>"]}   # blocks missed most of it
+            return {"text": text, "blocks": ["<p>Intro paragraph.</p>"]}
     result = make_session(markdown=True)._wait_for_completion(LossyPage([""]), new_future())
     assert result.count("Important detail") == 10
 
@@ -244,8 +239,7 @@ def test_waits_for_stop_button(monkeypatch):
 
 
 def test_pause_without_stop_button_does_not_end_reply(monkeypatch):
-    """STOP_SEL matches nothing: a pause longer than STABLE_SECONDS must not cut the reply off."""
-    snaps = ["Part one"] * 60 + ["Part one and part two."]   # ~60+ ms pause, > STABLE_SECONDS (20 ms)
+    snaps = ["Part one"] * 60 + ["Part one and part two."]
     got, result, fut = run(FakePage(snaps, generating_until=0), "text", monkeypatch)
     assert result == "Part one and part two." == "".join(got)
     assert not fut.truncated
@@ -260,6 +254,11 @@ def test_hard_timeout_marks_truncated(monkeypatch):
     monkeypatch.setattr(config, "REPLY_TIMEOUT", 0.1)
     got, result, fut = run(EndlessPage(), "text", monkeypatch)
     assert fut.truncated and result and "".join(got).strip() == result
+
+
+def test_answer_plain_recorded(monkeypatch):
+    got, result, fut = run(FakePage(["The", "The answer."], generating_until=2), "text", monkeypatch)
+    assert fut.answer_plain == "The answer."
 
 
 # ---------------------------------------------------------------- text mode
@@ -298,16 +297,17 @@ REASONING_REPLY = [
     {"reasoning": "Thinking... The user asks about headway. Check T0 and T1.", "answer": "Headway is"},
     {"reasoning": "", "answer": "Headway is the time between trains."},   # panel collapsed
 ]
+TAGGED = ("<think>\nThinking... The user asks about headway. Check T0 and T1.\n</think>\n\n"
+          "Headway is the time between trains.")
 
 
 @pytest.mark.parametrize("mode", ["text", pytest.param("markdown", marks=needs_md)])
 def test_reasoning_streamed_in_think_tags_before_answer(monkeypatch, mode):
     got, result, fut = run(FakePage(REASONING_REPLY, generating_until=5), mode, monkeypatch)
     streamed = "".join(got)
-    assert streamed == result == fut.streamed_text
-    assert streamed == ("<think>\nThinking... The user asks about headway. Check T0 and T1.\n</think>\n\n"
-                        "Headway is the time between trains.")
+    assert streamed == result == fut.streamed_text == TAGGED
     assert got[0] == "<think>\n" and got[1] == "Thinking..."     # reasoning streams live
+    assert fut.answer_plain == "Headway is the time between trains."
 
 
 def test_custom_think_tag(monkeypatch):
@@ -318,9 +318,7 @@ def test_custom_think_tag(monkeypatch):
 
 
 def test_reasoning_non_streaming(monkeypatch):
-    result = make_session()._wait_for_completion(FakePage(REASONING_REPLY, 5), new_future())
-    assert result == ("<think>\nThinking... The user asks about headway. Check T0 and T1.\n</think>\n\n"
-                      "Headway is the time between trains.")
+    assert make_session()._wait_for_completion(FakePage(REASONING_REPLY, 5), new_future()) == TAGGED
 
 
 def test_reasoning_disabled(monkeypatch):
@@ -335,14 +333,12 @@ def test_no_reasoning_no_tags(monkeypatch):
 
 
 def test_reasoning_only_seen_at_end_still_wrapped(monkeypatch):
-    # reasoning appears in the same poll as the answer start -> sent whole before the answer
     snaps = [{"reasoning": "Short thought.", "answer": "Answer"}, {"reasoning": "Short thought.", "answer": "Answer."}]
     got, result, _ = run(FakePage(snaps, generating_until=2), "text", monkeypatch)
     assert result == "<think>\nShort thought.\n</think>\n\nAnswer."
 
 
 def test_long_reasoning_phase_does_not_finish_reply(monkeypatch):
-    """No answer text yet: a long reasoning-only phase must not end the reply."""
     snaps = [{"reasoning": "step"}] * 80 + [{"reasoning": "step done", "answer": "Final answer."}]
     got, result, _ = run(FakePage(snaps, generating_until=0), "text", monkeypatch)
     assert result.endswith("Final answer.") and "".join(got) == result

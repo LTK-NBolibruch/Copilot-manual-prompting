@@ -3,6 +3,12 @@
 CopilotSession keeps ONE Edge instance open and serves prompts one at a time
 from a dedicated worker thread (Playwright's sync API is thread-bound).
 
+Resuming: submit(..., resume={"url", "reply_hash", "prompt"}) reopens an
+existing Copilot chat and sends only resume["prompt"] (the new user message),
+after checking that the chat's last reply matches resume["reply_hash"]. If the
+chat can't be opened or is in a different state (e.g. the client regenerated
+an earlier reply), a new chat is started with the full prompt instead.
+
 Streaming (submit(prompt, on_delta=callable)) has two modes, set by
 config.STREAM_MODE:
 
@@ -22,8 +28,14 @@ config.REASONING_SEL, is sent first, wrapped in <THINK_TAG> ... </THINK_TAG>
 
 Completeness: when the reply finishes, whatever the client has not received
 yet is always sent, even if Copilot re-rendered earlier text (see remainder()).
-Future.result() is the full reply; Future.streamed_text is exactly what was
-sent through on_delta; Future.truncated is True if the reply hit REPLY_TIMEOUT.
+
+Future attributes set by the worker:
+    result()        full reply (tagged reasoning + answer)
+    streamed_text   exactly what was sent through on_delta
+    truncated       True if the reply hit REPLY_TIMEOUT
+    answer_plain    the answer's plain page text (used to fingerprint the chat)
+    chat_url        the Copilot conversation URL, if one was detected
+    resumed         True if an existing chat was continued
 """
 import difflib
 import logging
@@ -36,6 +48,7 @@ from concurrent.futures import Future
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 import config
+from conversations import conversation_url, fingerprint
 
 log = logging.getLogger("copilot")
 
@@ -68,8 +81,8 @@ def _on_login_page(page) -> bool:
     return _is_login_url(page.url)
 
 
-# Reads the last reply: its plain text (for completion detection) and its
-# top-level blocks as cleaned HTML (for markdown conversion).
+# Reads the last reply: reasoning text, the answer's plain text (for completion
+# detection) and the answer's top-level blocks as cleaned HTML (for markdown).
 SNAPSHOT_JS = r"""
 ([sel, noise, rsel, rBefore]) => {
   const pick = e => (e.innerText || '').trim() || (e.textContent || '').trim();  // collapsed panels: textContent
@@ -253,6 +266,7 @@ class CopilotSession:
         self.markdown = markdown and _to_md is not None
         self._md_cache: dict[str, str] = {}
         self._warned_no_stop = False
+        self._r_before = 0
         self._q: "queue.Queue" = queue.Queue()
         self._ready = threading.Event()
         self._startup_error = None
@@ -266,24 +280,26 @@ class CopilotSession:
     @staticmethod
     def result_timeout() -> float:
         """How long a caller should wait for one reply (queue wait not included)."""
-        return config.REPLY_TIMEOUT + config.START_TIMEOUT + config.INPUT_TIMEOUT + 120
+        return (config.REPLY_TIMEOUT + config.START_TIMEOUT + config.INPUT_TIMEOUT
+                + config.RESUME_LOAD_TIMEOUT + 120)
 
     def ask(self, prompt: str, timeout: float | None = None) -> str:
         return self.submit(prompt).result(timeout=timeout or self.result_timeout())
 
-    def submit(self, prompt: str, on_delta=None) -> Future:
+    def submit(self, prompt: str, on_delta=None, resume=None) -> Future:
         """Queue a prompt without blocking; returns a Future.
 
         on_delta(text) is called from the worker thread with each new piece
         of the reply while it is being written. Keep it fast (e.g. queue.put).
+        resume={"url", "reply_hash", "prompt"} continues an existing chat (see module doc).
         """
         prompt = (prompt or "").strip()
         if not prompt:
             raise ValueError("Empty prompt provided.")
         fut: Future = Future()
-        fut.streamed_text = ""
-        fut.truncated = False
-        self._q.put((prompt, fut, on_delta))
+        fut.streamed_text, fut.truncated, fut.answer_plain = "", False, ""
+        fut.chat_url, fut.resumed = None, False
+        self._q.put((prompt, fut, on_delta, resume))
         return fut
 
     @property
@@ -328,13 +344,14 @@ class CopilotSession:
                 item = self._q.get()
                 if item is None:
                     break
-                prompt, fut, on_delta = item
+                prompt, fut, on_delta, resume = item
                 if not fut.set_running_or_notify_cancel():
                     continue
                 try:
                     t0 = time.time()
-                    fut.set_result(self._ask(page, prompt, fut, on_delta))
-                    log.info("Prompt answered in %.1fs", time.time() - t0)
+                    fut.set_result(self._ask(page, prompt, fut, on_delta, resume))
+                    log.info("Prompt answered in %.1fs%s", time.time() - t0,
+                             " (resumed chat)" if fut.resumed else "")
                 except Exception as e:
                     self._screenshot(page)
                     log.exception("Prompt failed")
@@ -370,7 +387,7 @@ class CopilotSession:
         print(f"\n>>> Please sign in to Microsoft 365 in the browser window "
               f"(waiting up to {config.LOGIN_TIMEOUT // 60} min)...", flush=True)
         try:
-            page.wait_for_url(lambda url: not _is_login_url(url) and "m365.cloud.microsoft" in url,
+            page.wait_for_url(lambda url: not _is_login_url(url) and "cloud.microsoft" in url,
                               timeout=config.LOGIN_TIMEOUT * 1000)
         except PWTimeout:
             raise LoginRequired("Sign-in was not completed in time.")
@@ -379,9 +396,51 @@ class CopilotSession:
         if "/chat" not in page.url:
             page.goto(config.CHAT_URL, wait_until="domcontentloaded")
 
-    def _ask(self, page, prompt: str, fut: Future, on_delta=None) -> str:
-        page.goto(config.CHAT_URL, wait_until="domcontentloaded")  # fresh chat per prompt
-        self._ensure_signed_in(page)
+    def _open_existing(self, page, resume) -> bool:
+        """Open a stored chat and check its last reply is the one we recorded.
+
+        True: the chat is ready to continue. False: fall back to a new chat.
+        LoginRequired propagates.
+        """
+        url = resume["url"]
+        try:
+            page.goto(url, wait_until="domcontentloaded")
+            self._ensure_signed_in(page)
+            page.wait_for_function("sel => document.querySelectorAll(sel).length > 0",
+                                   arg=config.REPLY_SEL, timeout=config.RESUME_LOAD_TIMEOUT * 1000)
+        except LoginRequired:
+            raise
+        except Exception as e:
+            log.info("Could not reopen %s (%s) - starting a new chat", url, type(e).__name__)
+            return False
+        if conversation_url(page.url) != conversation_url(url):
+            log.info("Reopening %s landed on %s - starting a new chat", url, page.url)
+            return False
+
+        # Let the chat finish rendering, then compare its last reply.
+        prev, deadline = None, time.time() + 10
+        while time.time() < deadline:
+            _, text, _ = self._snapshot(page)
+            if text and text == prev:
+                break
+            prev = text
+            time.sleep(0.5 if config.POLL_INTERVAL >= 0.5 else config.POLL_INTERVAL)
+        if fingerprint(prev or "") != resume["reply_hash"]:
+            log.info("Chat %s has moved on or changed since it was recorded (client regenerated or edited "
+                     "a reply?) - starting a new chat", url)
+            return False
+        return True
+
+    def _ask(self, page, prompt: str, fut: Future, on_delta=None, resume=None) -> str:
+        resumed = False
+        if resume:
+            resumed = self._open_existing(page, resume)
+        if resumed:
+            prompt = resume["prompt"].strip()
+            fut.resumed = True
+        else:
+            page.goto(config.CHAT_URL, wait_until="domcontentloaded")  # fresh chat
+            self._ensure_signed_in(page)
 
         try:  # dismiss "Try the app" popover if present
             page.locator(config.POPOVER_SEL).first.click(timeout=2500)
@@ -429,13 +488,17 @@ class CopilotSession:
             raise CopilotError("Copilot did not start replying in time.")
 
         # 2) wait for it to finish, streaming deltas if requested
-        return self._wait_for_completion(page, fut, on_delta)
+        result = self._wait_for_completion(page, fut, on_delta)
+        fut.chat_url = conversation_url(page.url)
+        if not fut.chat_url:
+            log.info("No conversation URL found after the reply (%s); this chat can't be resumed", page.url)
+        return result
 
     # ---------- reply reading ----------
     def _snapshot(self, page) -> tuple[str, str, list[str]]:
         """(reasoning text, answer text, answer blocks as HTML)."""
         snap = page.evaluate(SNAPSHOT_JS, [config.REPLY_SEL, config.NOISE_SEL,
-                                           config.REASONING_SEL, getattr(self, "_r_before", 0)])
+                                           config.REASONING_SEL, self._r_before])
         return snap.get("reasoning") or "", snap.get("text") or "", snap.get("blocks") or []
 
     def _block_md(self, html: str) -> str:
@@ -515,9 +578,9 @@ class CopilotSession:
             if streaming and text.strip():
                 close_think()                   # the answer has started: reasoning phase is over
                 if mode == "text":
-                    self._emit(fut, on_delta, tracker.feed(text))
+                    emit(tracker.feed(text))
                 elif mode == "markdown":
-                    self._emit(fut, on_delta, blocks.update(self._blocks_md(blocks_html)))
+                    emit(blocks.update(self._blocks_md(blocks_html)))
 
             generating = page.locator(config.STOP_SEL).count() > 0
             stop_seen = stop_seen or generating
@@ -549,6 +612,7 @@ class CopilotSession:
                         config.STABLE_SECONDS_NO_STOP, config.STABLE_SECONDS)
 
         plain = (last_text or "").strip()
+        fut.answer_plain = plain
         use_md = (self.markdown or mode == "markdown") and _to_md is not None and mode != "text"
         answer = self._final_text(plain, last_blocks, use_md)
         reasoning_final = reasoning_best.strip() if with_reasoning else ""

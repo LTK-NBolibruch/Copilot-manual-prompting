@@ -17,13 +17,14 @@ import json
 import logging
 import os
 import queue
-import re
 import time
 import uuid
 from concurrent.futures import TimeoutError as FutureTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import config
+from conversations import (ConversationStore, fingerprint, history_key, log_conversation, strip_reasoning,
+                           text_of)
 from copilot import CopilotSession, CopilotError, LoginRequired, PromptTooLong
 
 log = logging.getLogger("server")
@@ -37,30 +38,25 @@ def model_obj():
     return {"id": config.MODEL_ID, "object": "model", "created": CREATED, "owned_by": "microsoft"}
 
 
-def flatten_messages(messages):
-    """Turn an OpenAI messages[] list into one Copilot prompt.
-
-    Copilot has no memory between prompts (each is a fresh chat), so system
-    instructions and prior turns are included as plain text.
-    """
-    def text_of(content):
-        if isinstance(content, list):  # [{"type":"text","text":...}, {"type":"image_url",...}]
-            return "\n".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
-        return content or ""
-
-    def strip_reasoning(text):
-        # Clients may send earlier replies back with their <think>...</think> block; don't re-send it.
-        tag = re.escape(config.THINK_TAG)
-        return re.sub(rf"<{tag}>.*?</{tag}>\s*", "", text, flags=re.S)
-
-    msgs = []
+def clean_messages(messages):
+    """Messages with text content; earlier replies' reasoning blocks removed."""
+    out = []
     for m in messages:
         if not isinstance(m, dict):
             continue
         if m.get("role") == "assistant":
             m = {**m, "content": strip_reasoning(text_of(m.get("content")))}
         if text_of(m.get("content")).strip():
-            msgs.append(m)
+            out.append(m)
+    return out
+
+
+def flatten_messages(messages):
+    """Turn an OpenAI messages[] list into one Copilot prompt for a NEW chat.
+
+    System instructions and prior turns are included as plain text.
+    """
+    msgs = clean_messages(messages)
     if not msgs:
         raise ValueError("'messages' must contain at least one message with text content.")
 
@@ -100,13 +96,15 @@ def finish_reason(fut):
 
 
 def result_timeout():
-    return config.REPLY_TIMEOUT + config.START_TIMEOUT + config.INPUT_TIMEOUT + 120
+    return (config.REPLY_TIMEOUT + config.START_TIMEOUT + config.INPUT_TIMEOUT
+            + config.RESUME_LOAD_TIMEOUT + 120)
 
 
 class Handler(BaseHTTPRequestHandler):
     session: CopilotSession = None
+    store: ConversationStore = None   # None = resuming disabled
     protocol_version = "HTTP/1.1"
-    server_version = "CopilotLocal/1.4"
+    server_version = "CopilotLocal/1.5"
 
     # ---------- helpers
     def _json(self, status, obj):
@@ -146,6 +144,33 @@ class Handler(BaseHTTPRequestHandler):
     def _path(self):
         return self.path.split("?")[0].rstrip("/")
 
+    # ---------- conversation resuming
+    def _plan_resume(self, messages):
+        """resume dict for CopilotSession.submit(), or None to start a new chat."""
+        if self.store is None:
+            return None
+        msgs = clean_messages(messages)
+        if len(msgs) < 3 or msgs[-1].get("role", "user") != "user" or msgs[-2].get("role") != "assistant":
+            return None
+        hit = self.store.get(history_key(msgs[:-1]))
+        if not hit:
+            return None
+        if hit["turns"] >= config.MAX_TURNS:
+            log.info("Chat %s reached COPILOT_MAX_TURNS=%d - starting a new chat", hit["url"], config.MAX_TURNS)
+            return None
+        return {**hit, "prompt": text_of(msgs[-1]["content"]).strip()}
+
+    def _record(self, messages, fut, client_text, resume):
+        """Remember which Copilot chat now holds messages + this reply."""
+        reply = client_text or ""
+        log_conversation(messages, reply, getattr(fut, "chat_url", None), getattr(fut, "resumed", False))
+        if self.store is None or not getattr(fut, "chat_url", None) or not getattr(fut, "answer_plain", ""):
+            return
+        turns = resume["turns"] + 1 if getattr(fut, "resumed", False) else 1
+        history = clean_messages(messages)
+        self.store.put(history_key(history + [{"role": "assistant", "content": reply}]),
+                       fut.chat_url, turns, fingerprint(fut.answer_plain))
+
     # ---------- methods
     def do_OPTIONS(self):
         self.send_response(204)
@@ -159,7 +184,8 @@ class Handler(BaseHTTPRequestHandler):
         p = self._path()
         if p in ("/health", "/v1/health"):
             return self._json(200, {"status": "ok", "worker_alive": self.session.alive,
-                                    "queue_depth": self.session.pending})
+                                    "queue_depth": self.session.pending,
+                                    "stored_conversations": len(self.store) if self.store is not None else None})
         if p == "/v1/models":
             return self._json(200, {"object": "list", "data": [model_obj()]})
         if p.startswith("/v1/models/"):
@@ -183,7 +209,8 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(raw or b"{}")
             if not isinstance(body.get("messages"), list):
                 raise ValueError("'messages' is required and must be an array.")
-            prompt = flatten_messages(body["messages"])
+            messages = body["messages"]
+            prompt = flatten_messages(messages)
             if len(prompt) > config.MAX_PROMPT_CHARS:
                 raise ValueError(f"Prompt exceeds {config.MAX_PROMPT_CHARS} characters after flattening.")
         except json.JSONDecodeError:
@@ -191,16 +218,17 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as e:
             return self._error(400, str(e))
 
+        resume = self._plan_resume(messages)
         model = body.get("model") or config.MODEL_ID
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(time.time())
         t0 = time.time()
 
         if body.get("stream"):
-            return self._stream(prompt, model, cid, created, body, t0)
+            return self._stream(prompt, resume, messages, model, cid, created, body, t0)
 
         try:
-            fut = self.session.submit(prompt)
+            fut = self.session.submit(prompt, resume=resume)
             text = fut.result(timeout=result_timeout())
         except Exception as e:
             status, etype, code = error_status(e)
@@ -208,9 +236,11 @@ class Handler(BaseHTTPRequestHandler):
                 log.exception("Unhandled error")
             return self._error(status, str(e), etype, code)
 
+        self._record(messages, fut, text, resume)
         reason = finish_reason(fut)
-        log.info("completion %s %.1fs in=%d out=%d chars finish=%s",
-                 cid, time.time() - t0, len(prompt), len(text), reason)
+        log.info("completion %s %.1fs in=%d out=%d chars finish=%s %s",
+                 cid, time.time() - t0, len(prompt), len(text), reason,
+                 "resumed" if getattr(fut, "resumed", False) else "new-chat")
         self._json(200, {
             "id": cid, "object": "chat.completion", "created": created, "model": model,
             "system_fingerprint": None,
@@ -219,19 +249,18 @@ class Handler(BaseHTTPRequestHandler):
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         })
 
-    def _stream(self, prompt, model, cid, created, body, t0):
+    def _stream(self, prompt, resume, messages, model, cid, created, body, t0):
         """Live Server-Sent Events.
 
         The worker pushes each new piece of Copilot's reply into a queue as it
-        appears on the page (finished markdown blocks, or plain text in text
-        mode) and, when the reply ends, whatever the client has not received
-        yet. This thread forwards them as chat.completion.chunk events, with
-        keep-alive comments while idle. The queue is drained completely before
-        the final chunk is sent.
+        appears on the page and, when the reply ends, whatever the client has
+        not received yet. This thread forwards them as chat.completion.chunk
+        events, with keep-alive comments while idle. The queue is drained
+        completely before the final chunk is sent.
         """
         events: "queue.Queue" = queue.Queue()
         try:
-            fut = self.session.submit(prompt, on_delta=events.put)
+            fut = self.session.submit(prompt, on_delta=events.put, resume=resume)
         except Exception as e:
             status, etype, code = error_status(e)
             return self._error(status, str(e), etype, code)
@@ -256,7 +285,7 @@ class Handler(BaseHTTPRequestHandler):
                   "system_fingerprint": None,
                   "choices": [{"index": 0, "delta": delta, "logprobs": None, "finish_reason": finish}]})
 
-        first_token_at, sent_chars = None, 0
+        first_token_at, sent = None, []
         try:
             chunk({"role": "assistant", "content": ""})
             while True:
@@ -271,7 +300,7 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 if first_token_at is None:
                     first_token_at = time.time()
-                sent_chars += len(item)
+                sent.append(item)
                 chunk({"content": item})
 
             exc = fut.exception()
@@ -281,17 +310,20 @@ class Handler(BaseHTTPRequestHandler):
                 send({"error": {"message": str(exc), "type": etype, "param": None, "code": code}})
             else:
                 # If nothing was streamed, send the whole reply at once.
-                if sent_chars == 0 and fut.result():
-                    sent_chars = len(fut.result())
+                if not sent and fut.result():
+                    sent.append(fut.result())
                     chunk({"content": fut.result()})
+                client_text = "".join(sent)
+                self._record(messages, fut, client_text, resume)
                 reason = finish_reason(fut)
                 chunk({}, reason)
                 if (body.get("stream_options") or {}).get("include_usage"):
                     send({"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
                           "choices": [], "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}})
                 ttft = f"{first_token_at - t0:.1f}s" if first_token_at else "n/a"
-                log.info("stream %s %.1fs first-text=%s in=%d streamed=%d final=%d chars finish=%s",
-                         cid, time.time() - t0, ttft, len(prompt), sent_chars, len(fut.result()), reason)
+                log.info("stream %s %.1fs first-text=%s in=%d streamed=%d final=%d chars finish=%s %s",
+                         cid, time.time() - t0, ttft, len(prompt), len(client_text), len(fut.result()), reason,
+                         "resumed" if getattr(fut, "resumed", False) else "new-chat")
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -312,9 +344,11 @@ def main():
                         handlers=[logging.StreamHandler(),
                                   logging.FileHandler(os.path.join(config.LOG_DIR, "server.log"), encoding="utf-8")])
 
+    Handler.store = ConversationStore() if config.RESUME_CONVERSATIONS else None
     Handler.session = CopilotSession(show_window=args.show)
     server = ThreadingHTTPServer((config.HOST, args.port), Handler)
-    log.info("OpenAI-compatible API at http://%s:%d/v1  (model: %s)", config.HOST, args.port, config.MODEL_ID)
+    log.info("OpenAI-compatible API at http://%s:%d/v1  (model: %s, resume chats: %s)", config.HOST, args.port,
+             config.MODEL_ID, "on" if Handler.store is not None else "off")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -322,6 +356,8 @@ def main():
     finally:
         server.server_close()
         Handler.session.close()
+        if Handler.store is not None:
+            Handler.store.close()
 
 
 if __name__ == "__main__":

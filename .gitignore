@@ -1,6 +1,8 @@
 playwright_profile/
 logs/
+conversations.db
 __pycache__/
 *.pyc
 .venv/
 .pytest_cache/
+.vs/

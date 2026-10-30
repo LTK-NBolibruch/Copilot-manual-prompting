@@ -5,7 +5,7 @@
 There's no authentication or token handling: the server listens on `127.0.0.1` only, and any `api_key` a client sends is ignored.
 
 ```
-OpenAI client ──▶ http://127.0.0.1:5000/v1 ──queue──▶ one Edge session ──▶ m365.cloud.microsoft/chat
+OpenAI client ──▶ http://127.0.0.1:5000/v1 ──queue──▶ one Edge session ──▶ Copilot chat (new or resumed)
 ```
 
 ## Setup
@@ -46,7 +46,43 @@ for chunk in client.chat.completions.create(model="m365-copilot", stream=True,
 | POST | `/v1/chat/completions` (also `/v1`) | Supports `stream: true/false` and `stream_options.include_usage` |
 | GET | `/v1/models` | Lists `m365-copilot` |
 | GET | `/v1/models/{id}` | Echoes any id, so hard-coded model names work |
-| GET | `/health` | Worker status and queue depth |
+| GET | `/health` | Worker status, queue depth and number of stored conversations |
+
+## Resuming conversations
+
+OpenAI clients send the whole conversation with every request. Instead of starting a new Copilot chat each time and pasting that history in, the server **continues the Copilot chat that already holds the conversation** and sends only the new user message.
+
+**How it works:**
+
+1. After each reply, the server records which Copilot chat (`.../chat/conversation/<id>`) now holds the conversation. The record goes in a local SQLite file, `conversations.db`. It's keyed on a hash of every message, including the reply just sent.
+2. On the next request, it hashes the earlier messages, everything except the new user message, and looks them up.
+3. **If there's a match,** the server reopens that chat and checks that its last reply is the one it recorded. If it is, it sends only the new message, so the system prompt isn't sent again.
+4. **If there's no match, or the check fails,** it starts a new chat with the full history pasted in, as before, and records that chat instead.
+
+**Matching ignores formatting.** The hashes ignore whitespace, punctuation, markdown and `<think>` blocks, so a client that stores replies slightly differently, or drops the reasoning, still matches.
+
+| Situation | What happens |
+|---|---|
+| Normal follow-up | Same chat; only the new message is sent |
+| You regenerate or edit an earlier message | No match, or the chat has moved on, so a new chat starts |
+| The system prompt changes | No match, so a new chat starts |
+| The chat was deleted or won't load | The check fails, so a new chat starts and the next turn resumes that one |
+| The chat reaches `COPILOT_MAX_TURNS` (30) | A new chat starts |
+| The sign-in has expired | 503 `login_required`, as for any request |
+
+**Settings and privacy:**
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `COPILOT_RESUME_CONVERSATIONS` | `1` | Set to `0` to start every request in a new chat (the old behaviour) |
+| `COPILOT_CONVERSATION_DB` | `./conversations.db` | Where the records are stored |
+| `COPILOT_CONVERSATION_TTL_DAYS` | `30` | Records unused this long are deleted at startup |
+| `COPILOT_MAX_TURNS` | `30` | Turns per Copilot chat before starting a new one |
+| `COPILOT_RESUME_LOAD_TIMEOUT` | `30` | Seconds to wait for a reopened chat to load |
+| `COPILOT_LOG_CONVERSATIONS` | `0` | Set to `1` to also append the full prompts and replies to `logs/conversations.jsonl`, for debugging |
+
+- **What's stored.** `conversations.db` holds only hashes, chat URLs and turn counts, no prompt or reply text. It's listed in `.gitignore`. Delete it at any time to forget all chats.
+- **The log.** Each request is logged as `resumed` or `new-chat` in `logs/server.log`, along with the reason when a stored chat couldn't be continued.
 
 ## Reasoning (`<think>` tags)
 
@@ -65,7 +101,7 @@ When Copilot shows a reasoning ("Thinking…") section before its answer, that t
 - **Turn it off** with `COPILOT_INCLUDE_REASONING=0`. Reasoning text is then dropped and only the answer is sent.
 - **Conversation history.** If a client sends earlier replies back in `messages`, their tagged reasoning blocks are removed before the prompt goes to Copilot.
 - **Selector.** The reasoning section is found with `REASONING_SEL`, also at the top of `config.py`. The default is a guess. If replies arrive without a `<think>` block, or with reasoning mixed into the answer, inspect the reasoning section in DevTools and set the right selector.
-- **Long reasoning.** The server now also starts reading when the reasoning section appears, not just the answer, and `COPILOT_START_TIMEOUT` is now 120 s.
+- **Long reasoning.** The server starts reading when either the reasoning section or the answer appears. `COPILOT_START_TIMEOUT` is 120 s.
 
 ## When is a reply finished?
 
@@ -119,7 +155,7 @@ When the reply finishes, the server always sends whatever the client hasn't rece
 
 | Feature | Behaviour |
 |---|---|
-| `messages` | Each request starts a **new Copilot chat**. A single user message is sent unchanged. When there's more, system/developer messages become an "Instructions:" block and earlier turns become a "Conversation so far:" transcript, followed by the latest user message. |
+| `messages` | A follow-up to a stored conversation continues that Copilot chat (see *Resuming conversations*). Otherwise a **new Copilot chat** starts: a single user message is sent unchanged, and for longer histories, system/developer messages become an "Instructions:" block and earlier turns become a "Conversation so far:" transcript, followed by the latest user message. |
 | `usage` | Always 0, because Copilot doesn't report token counts. |
 | `finish_reason` | `"stop"`, or `"length"` if `COPILOT_REPLY_TIMEOUT` cut the reply off. |
 | `temperature`, `max_tokens`, `top_p`, `top_k`, … | Accepted and ignored. |
@@ -144,13 +180,13 @@ python ask.py --stream "Explain headway in two paragraphs"
 python ask.py -i --stream              # interactive, streamed
 ```
 
-Stop the server before using `ask.py`, because both use the same browser profile.
+`ask.py` always starts a new chat for each prompt. Stop the server before using it, because both use the same browser profile.
 
 ## Notes
 
 - **One prompt at a time.** Concurrent requests queue up behind each other.
 - **Client timeouts.** Set the client timeout above `COPILOT_REPLY_TIMEOUT` (600 s). The OpenAI SDK's default is also 600 s, so raise it or lower the server limit.
-- **Logs.** `logs/server.log` records each request and how each reply ended (`stable`, `stuck` or `timeout`). For streamed replies it also records how long until the first text arrived and how much was streamed versus the final reply.
+- **Logs.** `logs/server.log` records each request, whether it resumed a chat, and how each reply ended (`stable`, `stuck` or `timeout`). For streamed replies it also records how long until the first text arrived and how much was streamed versus the final reply.
 - **Re-sign-in.** Stop the server, run `python ask.py --show "Reply with OK"`, then start it again.
-- **Settings.** Selectors, timeouts, poll intervals, stream mode, port and model name are in `config.py`, and each can be overridden with a `COPILOT_*` environment variable.
-- **Tests.** Run `pytest -q`. The browser is mocked, and the reply reading and streaming are tested against simulated Copilot replies. The browser-side script that reads the reply has not been tested against the real page.
+- **Settings.** Selectors, timeouts, poll intervals, stream mode, reasoning tags, conversation resuming, port and model name are in `config.py`, and each can be overridden with a `COPILOT_*` environment variable.
+- **Tests.** Run `pytest -q`. The browser is mocked; reply reading, streaming and chat resuming are tested against simulated Copilot pages. The browser-side scripts have not been tested against the real page.

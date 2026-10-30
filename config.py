@@ -6,6 +6,10 @@ def _env(name, default, cast=str):
     return cast(os.environ.get(name, default))
 
 
+def _flag(name, default):
+    return _env(name, default) not in ("0", "false", "no", "")
+
+
 # ---------------------------------------------------------------------------
 # Reasoning tags
 # Copilot's reasoning ("thinking") text is sent before the answer, wrapped as
@@ -14,7 +18,7 @@ def _env(name, default, cast=str):
 #     </think>
 # Change THINK_TAG to "thinking", "reasoning", etc. - the closing tag always matches.
 THINK_TAG         = _env("COPILOT_THINK_TAG", "think")
-INCLUDE_REASONING = _env("COPILOT_INCLUDE_REASONING", "1") not in ("0", "false", "no", "")
+INCLUDE_REASONING = _flag("COPILOT_INCLUDE_REASONING", "1")
 # Elements holding Copilot's reasoning text. This is a best guess - verify in DevTools
 # (inspect the "Thinking..." / "Reasoned for Ns" section of a reply) and adjust.
 REASONING_SEL     = _env("COPILOT_REASONING_SEL",
@@ -23,6 +27,17 @@ REASONING_SEL     = _env("COPILOT_REASONING_SEL",
                          '[class*="thinking" i], [class*="ChainOfThought"]')
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Conversation resuming
+# When a request's earlier messages match a Copilot chat this server created,
+# that chat is reopened and only the new user message is sent.
+RESUME_CONVERSATIONS = _flag("COPILOT_RESUME_CONVERSATIONS", "1")
+CONVERSATION_DB      = _env("COPILOT_CONVERSATION_DB", "./conversations.db")  # stores hashes + chat URLs only
+CONVERSATION_TTL_DAYS = _env("COPILOT_CONVERSATION_TTL_DAYS", 30, float)      # forget chats unused this long
+MAX_TURNS            = _env("COPILOT_MAX_TURNS", 30, int)                     # start a new chat after this many
+LOG_CONVERSATIONS    = _flag("COPILOT_LOG_CONVERSATIONS", "0")                # 1 = also save full text to
+                                                                              #     logs/conversations.jsonl
+# ---------------------------------------------------------------------------
 
 CHAT_URL        = _env("COPILOT_CHAT_URL", "https://m365.cloud.microsoft/chat/")
 PROFILE_DIR     = _env("COPILOT_PROFILE_DIR", "./playwright_profile")
@@ -48,6 +63,7 @@ INPUT_TIMEOUT = _env("COPILOT_INPUT_TIMEOUT", 20, int)
 START_TIMEOUT = _env("COPILOT_START_TIMEOUT", 120, int)   # wait for reasoning or reply to appear
 REPLY_TIMEOUT = _env("COPILOT_REPLY_TIMEOUT", 600, int)   # hard cap per reply; hitting it -> finish_reason "length"
 LOGIN_TIMEOUT = _env("COPILOT_LOGIN_TIMEOUT", 300, int)   # manual sign-in with --show
+RESUME_LOAD_TIMEOUT = _env("COPILOT_RESUME_LOAD_TIMEOUT", 30, int)  # reopening an existing chat
 
 # Completion detection: a reply is finished when its text has not changed for
 STABLE_SECONDS         = _env("COPILOT_STABLE_SECONDS", 4, float)          # ...and the Stop button is gone
