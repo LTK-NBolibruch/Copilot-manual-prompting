@@ -25,94 +25,57 @@ Only one of `server.py`, `manager.py` and `ask.py` can run at a time, because th
 ## Several sessions at once (`manager.py`)
 
 ```powershell
-python manager.py            # browser kept off-screen ("Show browser" brings it back)
-python manager.py --show     # browser visible: one window, one tab per session
-start_manager.cmd            # the same, without a console window
+python manager.py
+python manager.py --show
 ```
 
-**The manager uses a normal Edge.** It starts Edge itself, as an ordinary process with remote debugging on a local port, using the saved profile (`playwright_profile`). Each session then attaches to that Edge in its own tab. In an Edge launched *by Playwright*, Copilot only loads one chat at a time, so extra tabs never got past loading. A normal Edge doesn't have that limit. `server.py` and `ask.py` still use a Playwright-launched Edge, which is fine for a single session.
+### v16: isolated browsers instead of tabs
 
-The window lists one row per session: name, port, endpoint URL (selectable, so you can copy it), an on/off switch, a status and a **Remove** button.
+The manager no longer creates several Copilot tabs in one Edge. Repeated Playwright `connect_over_cdp()` calls attach to every existing page in the browser; a slow, discarded, or half-loaded page can make a later connection wait for all pages and time out. v16 removes that shared failure point.
 
-| Control | What it does |
-|---|---|
-| **Add** | Adds a session on the next port (5000, 5001, 5002, …) and switches it on |
-| **Switch on** | Opens a new tab in the browser and starts answering on that port |
-| **Switch off** | Stops taking requests on that port, lets a reply in progress finish (up to `COPILOT_STOP_TIMEOUT`, 60 s, then aborts it) and closes the tab |
-| **Switch, while "Starting…"** | Cancels the start and frees the port |
-| **Remove** | Stops the session **right away**, aborting a reply in progress or a start, and removes the row |
-| **Show browser / Hide browser** | Moves the Edge window on- or off-screen, for example to sign in. Not available with `COPILOT_EDGE_HIDDEN=headless` |
-| **Processes…** | Lists the browser processes using the profile, and lets you end leftovers (see below) |
-| **Retry** | Appears when the browser couldn't start. Starts it again once you've fixed the problem |
-| **Closing the window** | Switches every session off (replies in progress finish first), closes Edge, and waits until its processes are gone |
-| **Ctrl+C in the console** | Stops every session immediately, then closes Edge |
+Each session now gets:
 
-### Leftover browser processes
+- one normal Edge process;
+- one persistent copied profile under `session_profiles/session-<port>`;
+- one Copilot page;
+- one Playwright connection;
+- one API endpoint (`5000`, `5001`, and so on).
 
-Stale Edge processes, left behind by a crash, Ctrl+C or a killed Python, keep using the profile. A new Edge on that profile then can't start properly, and tabs fail to load. The manager deals with them in three ways.
+This uses more memory than tabs, but session 3 no longer depends on tabs 1 and 2 being healthy. Stopping or removing one row ends only that row's Edge process.
 
-**1. They're found before Edge starts.** Every Edge process names its profile on its command line (`--user-data-dir=…`), so the manager can find each one using `playwright_profile`, whoever started it. If there are any, Edge isn't started yet. A yellow bar explains what was found, with an **End them and start** button, and sessions show `Waiting for the browser`. If you end them another way, for example in Task Manager, the manager notices within a couple of seconds and starts by itself.
+### First run and sign-in
 
-**2. They're watched while it runs.** The manager re-checks every `COPILOT_PROCESS_SCAN_SECONDS` (10 s).
-- **The top line** shows this manager's Edge, for example `Browser: ready (off-screen) · Edge PID 4120, 17 processes`.
-- **The yellow bar** reappears with an **End them** button if leftovers or orphaned Playwright drivers turn up.
-- **Processes…** lists everything it found:
+1. Sign in once using the base profile:
+   ```powershell
+   python ask.py --show "Reply with OK"
+   ```
+2. Stop `ask.py`, `server.py`, Edge instances using the app profile, and the manager.
+3. Start `python manager.py`. The first time each port is used, the manager copies the signed-in base profile to `session_profiles/session-5000`, `session-5001`, etc. Runtime lock and cache files are excluded.
+4. Use the row's **Show** button if that isolated profile needs sign-in again.
 
-| What | Meaning | Can be ended here |
-|---|---|---|
-| Edge (this manager) | The Edge this manager started, with its process count | No: use **Retry** to restart it |
-| Edge left over from an earlier run | The program that started it is gone | Yes |
-| Edge used by another program | The program that started it is still running, usually `server.py` or `ask.py` (the *Started by* column names it) | Yes, which closes that program's browser |
-| Orphaned Playwright driver | A `node.exe` Playwright driver whose Python is gone (the `EPIPE` crash after Ctrl+C leaves these) | Yes |
+Session profiles persist and keep their own refreshed cookies. If the base sign-in changes and you want fresh copies, stop the manager and delete `session_profiles`; they will be recreated on the next start.
 
-Only processes using **this app's profile** are ever listed or ended, never your everyday Edge. The list is re-checked just before ending anything, so a process ID that Windows has reused since is never ended.
+### Controls
 
-**3. Windows ends them automatically.** At startup, `manager.py`, `server.py` and `ask.py` put themselves in a Windows *job object*. Windows then ends everything they started (Edge and the Playwright drivers) when the Python process exits, even if it crashes or is ended from Task Manager. Turn this off with `COPILOT_KILL_ON_EXIT=0`. If Windows refuses, a warning is logged and the leftovers are caught at the next start instead.
+- **Add** creates the next endpoint and starts its isolated Edge.
+- **On/Off** starts or stops that endpoint. Switching off while starting cancels it.
+- **Show & restart** restarts only that row in visible Edge mode so you can sign in or inspect it.
+- **Hide & restart** restarts only that row in true Edge headless mode. Because no normal window exists, Windows does not show an Edge taskbar icon.
+- **Remove** aborts that session, ends only its Edge, and removes the row.
+- Closing the manager ends all isolated Edge processes.
 
-**Per-tab process IDs aren't shown.** Edge can share one renderer process between tabs on the same site, so a session's tab doesn't reliably map to its own process.
+The status includes the Edge PID for each row. `COPILOT_KILL_ON_EXIT=1` still places all child processes in the Windows job object so they are ended if the manager exits unexpectedly.
 
-| Setting | Default | Purpose |
-|---|---|---|
-| `COPILOT_STALE_EDGE` | `ask` | Leftovers found before starting: `ask` (yellow bar, wait for you), `end` (end them automatically), `ignore` (start anyway) |
-| `COPILOT_PROCESS_SCAN_SECONDS` | `10` | How often the window re-checks the processes |
-| `COPILOT_KILL_ON_EXIT` | `1` | Windows: end Edge and the drivers when Python exits |
+### Settings
 
-Install **psutil** (it's in `requirements.txt`) for fast process listing. Without it, the manager asks PowerShell, which takes about a second per check.
+- `COPILOT_PROFILE_DIR` selects the signed-in base profile, default `./playwright_profile`.
+- `COPILOT_SESSION_PROFILE_ROOT` selects the isolated-profile folder, default `./session_profiles`.
+- `COPILOT_EDGE_HIDDEN` now defaults to `headless`. Set it to `offscreen` only if you prefer a normal off-screen window and accept that Windows will show its taskbar icon.
+- `COPILOT_BROWSER_START_TIMEOUT`, `COPILOT_SESSION_START_TIMEOUT`, `COPILOT_STOP_TIMEOUT`, and the stale-process settings continue to apply per browser.
 
-### Time limits
+A running normal Edge window always appears as a running application on the Windows taskbar. Moving it off-screen does not remove that icon. Switching an already running Edge process between headed and headless mode is not supported, so the manager performs a controlled per-session restart when you use **Show & restart** or **Hide & restart**. The API port is briefly unavailable during that restart, but the session profile and sign-in persist.
 
-Nothing waits forever:
-
-| Step | Limit | Setting |
-|---|---|---|
-| Edge opening its debugging port | 30 s | `COPILOT_BROWSER_START_TIMEOUT` |
-| A session's tab opening | 60 s | `COPILOT_SESSION_START_TIMEOUT` |
-| Switching off with a reply in progress | 60 s, then the reply is aborted | `COPILOT_STOP_TIMEOUT` |
-
-A session that hits a limit shows an error in its row and can be switched on again. Waiting for you to end leftover processes has no limit.
-
-### Signing in
-
-- **The top line says when you need to.** If the browser isn't signed in, it shows `Browser: not signed in - click Show browser and sign in`, and session rows show `On - not signed in`.
-- **How to sign in.** Click **Show browser**, then sign in in the Copilot tab. The sign-in is saved to the profile, and you can click **Hide browser** afterwards.
-- **Requests during sign-in.** While the window is shown, a request that hits the sign-in page waits up to `COPILOT_LOGIN_TIMEOUT` (5 min) for you to finish, instead of failing straight away.
-
-### Other details
-
-- **Concurrency.** Each session handles one request at a time, and sessions run in parallel. Point different clients, or different conversations, at different ports. Two requests sent to the same port queue up one after the other.
-- **Conversations are shared.** All sessions use one `conversations.db`, so a conversation started on 5000 can continue on 5001. Two sessions never continue the **same** Copilot chat at the same time: if a second request arrives for a chat that's busy, it starts a new chat instead.
-- **Status messages.**
-  - `Starting… 12s`: the session is opening its tab. Click the switch to cancel.
-  - `On (2 queued)`: requests waiting for that session.
-  - `Error: …`: for example `port 5001 unavailable`, if another program has the port. Switch it on again once it's fixed.
-- **The first port** comes from `COPILOT_PORT` (default 5000). Sessions aren't remembered between runs; the window always starts with one session.
-- **Finding Edge.** The manager looks for `msedge.exe` in the usual install folders. Set `COPILOT_EDGE_PATH` if it's somewhere else.
-- **Off-screen window.** The browser is a normal window placed off-screen (`COPILOT_EDGE_HIDDEN=offscreen`, the default). `headless` hides it completely, but then you can't sign in from the manager.
-- **Logs.** All sessions write to `logs/server.log`. Each line shows its session, for example `[copilot-5001]` or `:5001`. Ending processes is logged too, with each PID.
-
-**Unknowns to watch:**
-- **Copilot throttling.** All tabs use your one Microsoft 365 account. I don't know whether Copilot throttles several chats at once for one user, so start with two sessions and watch for errors or slow replies.
-- **Model selection across tabs.** If Copilot saves the model picker's choice per user, a session switching models could affect what another tab shows as selected. Each request selects its model just before sending, which should cover this, but it's untested.
+The conversation database is still shared, so a conversation can continue through another port. Two sessions still never continue the same stored Copilot chat simultaneously.
 
 ## Use from any OpenAI client
 

@@ -158,10 +158,11 @@ def find_edge() -> str:
     raise CopilotError("Could not find Microsoft Edge (msedge.exe). Set COPILOT_EDGE_PATH to its full path.")
 
 
-def edge_command(port: int, visible: bool) -> list[str]:
+def edge_command(port: int, visible: bool, profile_dir=None) -> list[str]:
     """Command line for a normal Edge with remote debugging, using the saved profile."""
+    profile_dir = profile_dir or config.PROFILE_DIR
     args = [find_edge(), f"--remote-debugging-port={port}",
-            f"--user-data-dir={os.path.abspath(config.PROFILE_DIR)}",
+            f"--user-data-dir={os.path.abspath(profile_dir)}",
             "--no-first-run", "--no-default-browser-check", *BROWSER_ARGS]
     if visible:
         args.append("--window-size=1280,900")
@@ -221,7 +222,8 @@ class BrowserHost:
     .error, .needs_sign_in, .visible, .blocked, .scan, .pid
     """
 
-    def __init__(self, show_window=False, start=True, monitor=True):
+    def __init__(self, show_window=False, start=True, monitor=True, profile_dir=None):
+        self.profile_dir = profile_dir or config.PROFILE_DIR
         self.visible = show_window
         self.headless = False
         self.cdp_port = None
@@ -252,7 +254,7 @@ class BrowserHost:
 
     def _monitor(self):
         while not self._monitor_stop.is_set():
-            self.scan = procs.scan(config.PROFILE_DIR, self.pid)
+            self.scan = procs.scan(self.profile_dir, self.pid)
             self._rescan.wait(config.PROCESS_SCAN_SECONDS)
             self._rescan.clear()
 
@@ -266,7 +268,7 @@ class BrowserHost:
         def run():
             self.busy = "Ending processes…"
             try:
-                procs.end_groups(config.PROFILE_DIR, pids=pids, our_pid=self.pid)
+                procs.end_groups(self.profile_dir, pids=pids, our_pid=self.pid)
             finally:
                 self.busy = ""
                 self.rescan()
@@ -303,11 +305,11 @@ class BrowserHost:
         self._thread.join(timeout=timeout)
         _end_process(self.proc)
         if self.proc is not None:           # helpers that outlive the main process
-            found = procs.scan(config.PROFILE_DIR)
+            found = procs.scan(self.profile_dir)
             mine = [g.pid for g in found.groups if set(g.pids) & ours]
             if mine:
-                procs.end_groups(config.PROFILE_DIR, pids=mine, wait=5)
-            if not procs.wait_profile_free(config.PROFILE_DIR, timeout=10):
+                procs.end_groups(self.profile_dir, pids=mine, wait=5)
+            if not procs.wait_profile_free(self.profile_dir, timeout=10):
                 log.warning("Edge processes are still using the profile after stopping")
         self.proc = None
         self.rescan()
@@ -342,7 +344,7 @@ class BrowserHost:
         False = stop was requested while waiting."""
         if config.STALE_EDGE == "ignore":
             return True
-        found = procs.scan(config.PROFILE_DIR)
+        found = procs.scan(self.profile_dir)
         if found.error or not found.blocking:
             return True
         if config.STALE_EDGE != "end":
@@ -354,7 +356,7 @@ class BrowserHost:
                 try:
                     cmd = self._cmds.get(timeout=2)
                 except queue.Empty:               # ended some other way (Task Manager, Processes list)?
-                    found = procs.scan(config.PROFILE_DIR)
+                    found = procs.scan(self.profile_dir)
                     if not found.error and not found.blocking:
                         self.blocked = None
                         log.info("The profile is free now - starting Edge")
@@ -369,7 +371,7 @@ class BrowserHost:
         self.blocked = None
         self.busy = "Ending processes…"
         try:
-            left = procs.end_groups(config.PROFILE_DIR, kinds=("leftover", "in-use", "driver"))
+            left = procs.end_groups(self.profile_dir, kinds=("leftover", "in-use", "driver"))
         finally:
             self.busy = ""
             self.rescan()
@@ -383,7 +385,7 @@ class BrowserHost:
             if not self._check_stale():
                 return
             self.proc = subprocess.Popen(
-                edge_command(self.cdp_port, self.visible), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                edge_command(self.cdp_port, self.visible, self.profile_dir), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))  # Ctrl+C in the console
             wait_for_devtools(self.cdp_port, self.proc, config.BROWSER_START_TIMEOUT)  # doesn't reach Edge
             with sync_playwright() as pw:
@@ -789,7 +791,7 @@ def configured_models() -> list[str]:
 
 class CopilotSession:
     def __init__(self, show_window=False, markdown=True, discover_models=True, cdp_url=None, name=None,
-                 cancel=None, is_visible=None, start_timeout=None):
+                 cancel=None, is_visible=None, start_timeout=None, reuse_existing=False):
         """cdp_url: connect to a BrowserHost and work in a new tab of it, instead of launching Edge.
         name: shown in log lines (thread name copilot-<name>).
         cancel: threading.Event - setting it while the session starts makes __init__ raise SessionCancelled.
@@ -800,6 +802,7 @@ class CopilotSession:
         self.markdown = markdown and _to_md is not None
         self.discover_models = discover_models
         self.cdp_url = cdp_url
+        self.reuse_existing = reuse_existing
         self.name = name or "worker"
         self.needs_sign_in = False
         self._aborted = False
@@ -948,7 +951,11 @@ class CopilotSession:
                 time.sleep(1)
             if not browser.contexts:
                 raise CopilotError("The shared browser has no profile context.")
-            page = browser.contexts[0].new_page()
+            ctx = browser.contexts[0]
+            if self.reuse_existing and ctx.pages:
+                page = ctx.pages[0]
+                return page, (lambda: None)  # BrowserHost owns this one-page browser
+            page = ctx.new_page()
             return page, page.close     # close only our tab; the host owns the browser
         ctx = _launch_edge(pw, self.show_window)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
