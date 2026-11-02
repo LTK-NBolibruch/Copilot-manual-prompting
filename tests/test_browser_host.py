@@ -247,3 +247,28 @@ def test_wait_ready_has_no_time_limit_while_blocked(blocked_host, monkeypatch):
     threading.Timer(0.6, ev.set).start()
     with pytest.raises(SessionCancelled):                   # not "did not start in time" after 0.1 s
         host.wait_ready(cancel=ev, timeout=0.1)
+
+def test_graceful_stop_uses_browser_close_before_force():
+    src=open(copilot.__file__,encoding='utf8').read()
+    assert 'send("Browser.close")' in src
+    assert 'self.proc.wait(timeout=config.EDGE_GRACEFUL_CLOSE_TIMEOUT)' in src
+    stop=src[src.index('    def stop(self, timeout=None, final=False):'):src.index('    def restart(self):')]
+    assert stop.index('self._thread.join') < stop.index('_end_process(self.proc)')
+
+class AuthPage:
+    def __init__(self,url,pages=None):
+        self.url=url;self._closed=False;self.context=type('C',(),{})();self.context.pages=pages or [self]
+    def is_closed(self): return self._closed
+
+def test_auth_scan_prefers_working_chat_over_stale_login_tab():
+    h=copilot.BrowserHost(start=False,monitor=False)
+    login=AuthPage('https://login.microsoftonline.com/common/oauth2/authorize')
+    chat=AuthPage('https://m365.cloud.microsoft/chat/')
+    login.context.pages=[login,chat];chat.context=login.context
+    h._check_sign_in(login)
+    assert h.auth_state=='signed_in' and not h.needs_sign_in
+
+def test_session_auth_callback_updates_host():
+    got=[];s=copilot.CopilotSession.__new__(copilot.CopilotSession);s._auth_callback=got.append;s.needs_sign_in=False
+    s._set_auth('signed_out');s._set_auth('signed_in')
+    assert got==['signed_out','signed_in'] and not s.needs_sign_in

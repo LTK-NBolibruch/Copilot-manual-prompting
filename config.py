@@ -80,7 +80,7 @@ EDGE_PATH   = _env("COPILOT_EDGE_PATH", "")           # msedge.exe; found automa
 # How the browser is kept out of sight when the manager runs without --show:
 #   offscreen - a normal window placed off-screen; "Show browser" in the manager brings it back (default)
 #   headless  - no window at all; you can't sign in from the manager in this mode
-EDGE_HIDDEN = _env("COPILOT_EDGE_HIDDEN", "headless")
+EDGE_HIDDEN = _env("COPILOT_EDGE_HIDDEN", "offscreen")
 BROWSER_START_TIMEOUT = _env("COPILOT_BROWSER_START_TIMEOUT", 30, int)   # Edge opening its debugging port
 SESSION_START_TIMEOUT = _env("COPILOT_SESSION_START_TIMEOUT", 60, int)   # a session's tab opening
 STOP_TIMEOUT          = _env("COPILOT_STOP_TIMEOUT", 60, int)            # switch off: wait this long for a
@@ -99,6 +99,8 @@ KILL_ON_EXIT         = _flag("COPILOT_KILL_ON_EXIT", "1")
 CHAT_URL        = _env("COPILOT_CHAT_URL", "https://m365.cloud.microsoft/chat/")
 PROFILE_DIR     = _env("COPILOT_PROFILE_DIR", "./playwright_profile")
 SESSION_PROFILE_ROOT = _env("COPILOT_SESSION_PROFILE_ROOT", "./session_profiles")
+VIRTUAL_DESKTOP_NAME = _env("COPILOT_VIRTUAL_DESKTOP_NAME", "Copilot Sessions")
+EDGE_GRACEFUL_CLOSE_TIMEOUT = _env("COPILOT_EDGE_GRACEFUL_CLOSE_TIMEOUT", 30, int)
 BROWSER_CHANNEL = _env("COPILOT_BROWSER_CHANNEL", "msedge")
 
 # Selectors - edit these when the Copilot UI changes

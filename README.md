@@ -24,58 +24,27 @@ Only one of `server.py`, `manager.py` and `ask.py` can run at a time, because th
 
 ## Several sessions at once (`manager.py`)
 
+`manager.py` creates or reuses the Windows 11 virtual desktop **Copilot Sessions** and moves every isolated Edge window there. Use the global **Show Copilot Sessions desktop** button to switch to it. A dialog on that desktop provides **Go back to last desktop**.
+
+Each row intentionally has one action control only:
+
+- **Start** when Off
+- **Cancel start** while starting
+- **Stop** when running
+- **Retry** after an error
+
+The redundant per-row Browser Action column has been removed. Workspace navigation is global, not a session action.
+
+Stopping is graceful: the API stops accepting work, the browser receives `Browser.close`, and the manager waits up to `COPILOT_EDGE_GRACEFUL_CLOSE_TIMEOUT` (default 30 seconds) for Edge to write its profile and exit naturally. Force termination is used only after that timeout. This prevents the recurring **Restore pages / Edge closed unexpectedly** prompt during normal manager shutdown.
+
+The **Processes…** dialog still lists active and stale process groups across the base and isolated profiles; active session groups are protected.
+
+Install dependencies and start:
+
 ```powershell
+pip install -r requirements.txt
 python manager.py
-python manager.py --show
 ```
-
-### v16: isolated browsers instead of tabs
-
-The manager no longer creates several Copilot tabs in one Edge. Repeated Playwright `connect_over_cdp()` calls attach to every existing page in the browser; a slow, discarded, or half-loaded page can make a later connection wait for all pages and time out. v16 removes that shared failure point.
-
-Each session now gets:
-
-- one normal Edge process;
-- one persistent copied profile under `session_profiles/session-<port>`;
-- one Copilot page;
-- one Playwright connection;
-- one API endpoint (`5000`, `5001`, and so on).
-
-This uses more memory than tabs, but session 3 no longer depends on tabs 1 and 2 being healthy. Stopping or removing one row ends only that row's Edge process.
-
-### First run and sign-in
-
-1. Sign in once using the base profile:
-   ```powershell
-   python ask.py --show "Reply with OK"
-   ```
-2. Stop `ask.py`, `server.py`, Edge instances using the app profile, and the manager.
-3. Start `python manager.py`. The first time each port is used, the manager copies the signed-in base profile to `session_profiles/session-5000`, `session-5001`, etc. Runtime lock and cache files are excluded.
-4. Use the row's **Show** button if that isolated profile needs sign-in again.
-
-Session profiles persist and keep their own refreshed cookies. If the base sign-in changes and you want fresh copies, stop the manager and delete `session_profiles`; they will be recreated on the next start.
-
-### Controls
-
-- **Add** creates the next endpoint and starts its isolated Edge.
-- **On/Off** starts or stops that endpoint. Switching off while starting cancels it.
-- **Show & restart** restarts only that row in visible Edge mode so you can sign in or inspect it.
-- **Hide & restart** restarts only that row in true Edge headless mode. Because no normal window exists, Windows does not show an Edge taskbar icon.
-- **Remove** aborts that session, ends only its Edge, and removes the row.
-- Closing the manager ends all isolated Edge processes.
-
-The status includes the Edge PID for each row. `COPILOT_KILL_ON_EXIT=1` still places all child processes in the Windows job object so they are ended if the manager exits unexpectedly.
-
-### Settings
-
-- `COPILOT_PROFILE_DIR` selects the signed-in base profile, default `./playwright_profile`.
-- `COPILOT_SESSION_PROFILE_ROOT` selects the isolated-profile folder, default `./session_profiles`.
-- `COPILOT_EDGE_HIDDEN` now defaults to `headless`. Set it to `offscreen` only if you prefer a normal off-screen window and accept that Windows will show its taskbar icon.
-- `COPILOT_BROWSER_START_TIMEOUT`, `COPILOT_SESSION_START_TIMEOUT`, `COPILOT_STOP_TIMEOUT`, and the stale-process settings continue to apply per browser.
-
-A running normal Edge window always appears as a running application on the Windows taskbar. Moving it off-screen does not remove that icon. Switching an already running Edge process between headed and headless mode is not supported, so the manager performs a controlled per-session restart when you use **Show & restart** or **Hide & restart**. The API port is briefly unavailable during that restart, but the session profile and sign-in persist.
-
-The conversation database is still shared, so a conversation can continue through another port. Two sessions still never continue the same stored Copilot chat simultaneously.
 
 ## Use from any OpenAI client
 

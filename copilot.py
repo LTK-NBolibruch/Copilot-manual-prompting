@@ -229,11 +229,13 @@ class BrowserHost:
         self.cdp_port = None
         self.ready = threading.Event()
         self.error = None
+        self.auth_state = "checking"
         self.needs_sign_in = False
         self.blocked = None                 # procs.Scan while waiting for leftovers to be ended
         self.busy = ""                      # e.g. "Ending leftover processes..."
         self.scan = None                    # latest procs.Scan
         self.proc = None
+        self._graceful_close = False
         self._cmds: "queue.Queue" = queue.Queue()
         self._thread = None
         self._monitor_stop = threading.Event()
@@ -284,35 +286,32 @@ class BrowserHost:
 
     def start(self):
         self.ready.clear()
-        self.error, self.needs_sign_in = None, False
+        self.error, self.auth_state, self.needs_sign_in = None, "checking", False
         self.cdp_port = free_port()
         self.headless = not self.visible and config.EDGE_HIDDEN == "headless"
         self._cmds = queue.Queue()
         self._thread = threading.Thread(target=self._run, daemon=True, name="browser-host")
         self._thread.start()
 
-    def stop(self, timeout=15, final=False):
+    def stop(self, timeout=None, final=False):
+        """Request Browser.close and wait for Edge to finish writing its profile.
+
+        Force termination is a last resort only after EDGE_GRACEFUL_CLOSE_TIMEOUT. This prevents
+        Edge's "closed unexpectedly / Restore pages" prompt on the next session start.
+        """
         if final:
-            self._monitor_stop.set()
-            self._rescan.set()
-        if self._thread is None:
-            return
-        last = self.scan
-        ours = set(last.ours.pids) if last is not None and last.ours else set()
-        if self.proc is not None:
-            ours.add(self.proc.pid)
+            self._monitor_stop.set(); self._rescan.set()
+        if self._thread is None: return True
+        limit = timeout if timeout is not None else config.EDGE_GRACEFUL_CLOSE_TIMEOUT + 10
         self._cmds.put(("stop",))
-        self._thread.join(timeout=timeout)
-        _end_process(self.proc)
-        if self.proc is not None:           # helpers that outlive the main process
-            found = procs.scan(self.profile_dir)
-            mine = [g.pid for g in found.groups if set(g.pids) & ours]
-            if mine:
-                procs.end_groups(self.profile_dir, pids=mine, wait=5)
-            if not procs.wait_profile_free(self.profile_dir, timeout=10):
-                log.warning("Edge processes are still using the profile after stopping")
-        self.proc = None
-        self.rescan()
+        self._thread.join(timeout=limit)
+        clean = not self._thread.is_alive()
+        if not clean:
+            log.warning("Edge did not exit cleanly within %ss; forcing PID %s", limit, self.pid)
+            _end_process(self.proc)
+            self._thread.join(timeout=5)
+        self.proc=None; self.rescan()
+        return clean
 
     def restart(self):
         self.stop()
@@ -411,10 +410,11 @@ class BrowserHost:
                         self._check_sign_in(page)
                         continue
                     if cmd[0] == "stop":
+                        self._graceful_close = True
                         try:
                             browser.new_browser_cdp_session().send("Browser.close")
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            log.warning("Browser.close failed: %s", e)
                         break
                     if cmd[0] == "end_stale":          # not blocked any more: nothing to do
                         continue
@@ -428,14 +428,37 @@ class BrowserHost:
             log.error("%s", self.error)
         finally:
             self.ready.set()
-            _end_process(self.proc)
+            if self.proc is not None and self.proc.poll() is None:
+                if self._graceful_close:
+                    try:
+                        self.proc.wait(timeout=config.EDGE_GRACEFUL_CLOSE_TIMEOUT)
+                        log.info("Edge PID %s exited cleanly", self.proc.pid)
+                    except Exception:
+                        log.warning("Edge PID %s did not finish graceful shutdown; forcing it", self.proc.pid)
+                        _end_process(self.proc)
+                else:
+                    _end_process(self.proc)
+
+    def set_auth_state(self, state):
+        """Single live authentication state shared with the session worker."""
+        if state not in ("checking", "signed_out", "signed_in"):
+            return
+        self.auth_state = state
+        self.needs_sign_in = state == "signed_out"
 
     def _check_sign_in(self, page):
-        url = page.url or ""
-        if _is_login_url(url):
-            self.needs_sign_in = True
-        elif "cloud.microsoft" in url:
-            self.needs_sign_in = False
+        """Inspect every page. A working Copilot chat beats a stale login tab."""
+        try:
+            pages = list(page.context.pages)
+        except Exception:
+            pages = [page]
+        urls = [(p.url or "") for p in pages if not p.is_closed()]
+        if any("cloud.microsoft" in u and "/chat" in u for u in urls):
+            self.set_auth_state("signed_in")
+        elif any(_is_login_url(u) for u in urls):
+            self.set_auth_state("signed_out")
+        else:
+            self.set_auth_state("checking")
 
     def _set_window(self, page, visible):
         cdp = page.context.new_cdp_session(page)
@@ -791,7 +814,7 @@ def configured_models() -> list[str]:
 
 class CopilotSession:
     def __init__(self, show_window=False, markdown=True, discover_models=True, cdp_url=None, name=None,
-                 cancel=None, is_visible=None, start_timeout=None, reuse_existing=False):
+                 cancel=None, is_visible=None, start_timeout=None, reuse_existing=False, auth_callback=None):
         """cdp_url: connect to a BrowserHost and work in a new tab of it, instead of launching Edge.
         name: shown in log lines (thread name copilot-<name>).
         cancel: threading.Event - setting it while the session starts makes __init__ raise SessionCancelled.
@@ -803,6 +826,7 @@ class CopilotSession:
         self.discover_models = discover_models
         self.cdp_url = cdp_url
         self.reuse_existing = reuse_existing
+        self._auth_callback = auth_callback
         self.name = name or "worker"
         self.needs_sign_in = False
         self._aborted = False
@@ -952,9 +976,7 @@ class CopilotSession:
             if not browser.contexts:
                 raise CopilotError("The shared browser has no profile context.")
             ctx = browser.contexts[0]
-            if self.reuse_existing and ctx.pages:
-                page = ctx.pages[0]
-                return page, (lambda: None)  # BrowserHost owns this one-page browser
+            if self.reuse_existing and ctx.pages: return ctx.pages[0], (lambda: None)
             page = ctx.new_page()
             return page, page.close     # close only our tab; the host owns the browser
         ctx = _launch_edge(pw, self.show_window)
@@ -1051,6 +1073,15 @@ class CopilotSession:
         except Exception:
             pass
 
+    def _set_auth(self, state):
+        self.needs_sign_in = state == "signed_out"
+        cb = getattr(self, "_auth_callback", None)
+        if cb:
+            try:
+                cb(state)
+            except Exception:
+                log.exception("Authentication state callback failed")
+
     def _ensure_signed_in(self, page):
         """If redirected to a Microsoft sign-in page, wait for the user (window visible) or fail fast."""
         try:  # sign-in redirects can happen a moment after the page loads
@@ -1058,9 +1089,9 @@ class CopilotSession:
         except PWTimeout:
             pass
         if not _on_login_page(page):
-            self.needs_sign_in = False
+            self._set_auth("signed_in")
             return
-        self.needs_sign_in = True
+        self._set_auth("signed_out")
         if not self._visible():
             raise LoginRequired("Not signed in - " + ("click Show browser in the manager and sign in."
                                                        if getattr(self, "cdp_url", None) else
@@ -1076,7 +1107,7 @@ class CopilotSession:
             if time.time() > deadline:
                 raise LoginRequired("Sign-in was not completed in time.")
             page.wait_for_timeout(1000)
-        self.needs_sign_in = False
+        self._set_auth("signed_in")
         log.info("Sign-in complete - session saved to %s", config.PROFILE_DIR)
         page.wait_for_load_state("domcontentloaded")
         if "/chat" not in page.url:
