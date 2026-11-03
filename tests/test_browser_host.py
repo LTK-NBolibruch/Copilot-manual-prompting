@@ -272,3 +272,22 @@ def test_session_auth_callback_updates_host():
     got=[];s=copilot.CopilotSession.__new__(copilot.CopilotSession);s._auth_callback=got.append;s.needs_sign_in=False
     s._set_auth('signed_out');s._set_auth('signed_in')
     assert got==['signed_out','signed_in'] and not s.needs_sign_in
+
+def test_verified_auth_cannot_be_demoted_by_url_monitor():
+    h=copilot.BrowserHost(start=False,monitor=False)
+    h.set_auth_state('signed_in',authoritative=True)
+    assert h.auth_verified and h.auth_state=='signed_in'
+    h.set_auth_state('signed_out')
+    h.set_auth_state('checking')
+    assert h.auth_verified and h.auth_state=='signed_in' and not h.needs_sign_in
+
+def test_authoritative_login_required_can_demote_verified_auth():
+    h=copilot.BrowserHost(start=False,monitor=False)
+    h.set_auth_state('signed_in',authoritative=True)
+    h.set_auth_state('signed_out',authoritative=True)
+    assert not h.auth_verified and h.auth_state=='signed_out' and h.needs_sign_in
+
+def test_model_picker_success_is_authentication_proof():
+    src=open(copilot.__file__,encoding='utf8').read()
+    block=src[src.index('def _refresh_models'):src.index('def _find_option')]
+    assert 'self._set_auth("signed_in", authoritative=True)' in block

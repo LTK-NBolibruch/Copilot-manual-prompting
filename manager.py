@@ -57,7 +57,7 @@ class Instance:
     def label(self):return {'off':'Start','starting':'Cancel start','on':'Stop','stopping':'Working…','error':'Retry','removed':'Removed'}[self.state]
     def status(self):
         if self.state=='on':
-            a=getattr(self.host,'auth_state','checking');return {'signed_in':'Ready · signed in','signed_out':'Sign-in required','checking':'Ready · checking sign-in'}[a]+f" · PID {self.host.pid}"
+            a='signed_in' if getattr(self.host,'auth_verified',False) else getattr(self.host,'auth_state','checking');return {'signed_in':'Ready · signed in','signed_out':'Sign-in required','checking':'Ready · checking sign-in'}[a]+f" · PID {self.host.pid}"
         if self.state=='error':return 'Error · '+self.error
         return {'off':'Off','starting':'Starting Edge…','stopping':'Stopping Edge cleanly…','removed':'Removed'}[self.state]
 def run(store):

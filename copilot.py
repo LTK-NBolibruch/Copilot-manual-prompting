@@ -230,6 +230,7 @@ class BrowserHost:
         self.ready = threading.Event()
         self.error = None
         self.auth_state = "checking"
+        self.auth_verified = False          # latched by successful Copilot operations
         self.needs_sign_in = False
         self.blocked = None                 # procs.Scan while waiting for leftovers to be ended
         self.busy = ""                      # e.g. "Ending leftover processes..."
@@ -286,7 +287,7 @@ class BrowserHost:
 
     def start(self):
         self.ready.clear()
-        self.error, self.auth_state, self.needs_sign_in = None, "checking", False
+        self.error, self.auth_state, self.auth_verified, self.needs_sign_in = None, "checking", False, False
         self.cdp_port = free_port()
         self.headless = not self.visible and config.EDGE_HIDDEN == "headless"
         self._cmds = queue.Queue()
@@ -439,9 +440,18 @@ class BrowserHost:
                 else:
                     _end_process(self.proc)
 
-    def set_auth_state(self, state):
-        """Single live authentication state shared with the session worker."""
+    def set_auth_state(self, state, authoritative=False):
+        """Update authentication state.
+
+        A successful Copilot operation is authoritative and latches signed_in. URL monitoring may
+        promote a session, but may not demote a verified working session because stale login tabs
+        and transient redirects are common. Only an authoritative LoginRequired can demote it.
+        """
         if state not in ("checking", "signed_out", "signed_in"):
+            return
+        if authoritative:
+            self.auth_verified = state == "signed_in"
+        elif self.auth_verified and state != "signed_in":
             return
         self.auth_state = state
         self.needs_sign_in = state == "signed_out"
@@ -1073,11 +1083,13 @@ class CopilotSession:
         except Exception:
             pass
 
-    def _set_auth(self, state):
+    def _set_auth(self, state, authoritative=True):
         self.needs_sign_in = state == "signed_out"
         cb = getattr(self, "_auth_callback", None)
         if cb:
             try:
+                cb(state, authoritative=authoritative)
+            except TypeError:               # compatibility with simple callbacks/tests
                 cb(state)
             except Exception:
                 log.exception("Authentication state callback failed")
@@ -1227,6 +1239,7 @@ class CopilotSession:
             with self._models_lock:
                 self._models.update(names=names, paths=paths, keys=keys, fetched=time.time(), source="picker",
                                     current=current or self._models["current"])
+            self._set_auth("signed_in", authoritative=True)
             log.info("Models in the picker: %s (selected: %s)", ", ".join(
                 f"{' > '.join(paths[n] + [n])}" for n in names), current)
             if failed:
@@ -1381,6 +1394,9 @@ class CopilotSession:
                 box.wait_for(state="visible", timeout=config.INPUT_TIMEOUT * 1000)
             else:
                 raise CopilotError("Chat input not found - selectors may need updating (see config.py).")
+
+        # A visible Copilot editor is proof that this session is operationally authenticated.
+        self._set_auth("signed_in", authoritative=True)
 
         if model:
             self._select_model(page, model)

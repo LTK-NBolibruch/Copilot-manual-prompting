@@ -10,7 +10,7 @@ class Srv:
  def shutdown(self):pass
  def server_close(self):pass
 class Host:
- def __init__(self,**k):self.pid=10;self.cdp_url='x';self.auth_state='signed_in'
+ def __init__(self,**k):self.pid=10;self.cdp_url='x';self.auth_state='signed_in';self.auth_verified=False
  def set_auth_state(self,state):self.auth_state=state
  def wait_ready(self,*a):pass
  def stop(self,**k):return True
@@ -36,3 +36,7 @@ def test_show_switches_before_creating_return_dialog():
 
 def test_endpoint_is_directly_populated():
  src=open(manager.__file__,encoding='utf8').read();assert "endpoint.insert(0,x.url)" in src and 'textvariable=url' not in src
+
+def test_ui_prefers_verified_operational_auth():
+ x=manager.Instance(1,5000,Desk());x.state='on';x.host=Host();x.host.auth_state='signed_out';x.host.auth_verified=True
+ assert x.status().startswith('Ready · signed in')
