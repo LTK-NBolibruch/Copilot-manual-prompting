@@ -22,7 +22,7 @@ class Session:
 def setup_function():
  manager.BrowserHost=Host;manager.CopilotSession=Session;manager.server.make_server=lambda *a,**k:Srv();manager.server.serve_in_background=lambda x:None
 def test_action_labels_are_unambiguous(tmp_path):
- config.SESSION_PROFILE_ROOT=str(tmp_path);x=manager.Instance(1,5000,Desk());assert x.label()=='Start';x.start(None);time.sleep(.1);assert x.label()=='Stop';x.action(None);time.sleep(.1);assert x.label()=='Start'
+ config.SESSION_PROFILE_ROOT=str(tmp_path);x=manager.Instance(1,5000,Desk(),None);assert x.label()=='Start';x.start(None);time.sleep(.1);assert x.label()=='Stop';x.action(None);time.sleep(.1);assert x.label()=='Start'
 def test_row_has_no_browser_action_column():
  src=open(manager.__file__,encoding='utf8').read();assert "'Browser action'" not in src and 'Show Copilot Sessions desktop' in src
 def test_separate_profiles(tmp_path):
@@ -38,5 +38,10 @@ def test_endpoint_is_directly_populated():
  src=open(manager.__file__,encoding='utf8').read();assert "endpoint.insert(0,x.url)" in src and 'textvariable=url' not in src
 
 def test_ui_prefers_verified_operational_auth():
- x=manager.Instance(1,5000,Desk());x.state='on';x.host=Host();x.host.auth_state='signed_out';x.host.auth_verified=True
+ x=manager.Instance(1,5000,Desk(),None);x.state='on';x.host=Host();x.host.auth_state='signed_out';x.host.auth_verified=True
  assert x.status().startswith('Ready · signed in')
+
+def test_replay_ui_has_search_paging_and_scrollable_preview():
+ src=open(manager.__file__,encoding='utf8').read()
+ for text in ('history_search','Load 100 more','ttk.Scrollbar','Copy all'):
+  assert text in src

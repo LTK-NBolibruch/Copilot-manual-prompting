@@ -22,29 +22,47 @@ python manager.py                      # or: a window for several endpoints (500
 
 Only one of `server.py`, `manager.py` and `ask.py` can run at a time, because they share the browser profile.
 
-## Several sessions at once (`manager.py`)
+## Several sessions, history import, and one-shot replay
 
-`manager.py` creates or reuses the Windows 11 virtual desktop **Copilot Sessions** and moves every isolated Edge window there. Use the global **Show Copilot Sessions desktop** button to switch to it. A dialog on that desktop provides **Go back to last desktop**.
+`manager.py` keeps isolated Edge sessions on the Windows 11 **Copilot Sessions** desktop and adds a durable conversation library.
 
-Each row intentionally has one action control only:
+### Local and imported history
 
-- **Start** when Off
-- **Cancel start** while starting
-- **Stop** when running
-- **Retry** after an error
+Every completed API reply stores structured user/agent messages in `conversations.db`. Use **Import from Copilot** to scan the conversation links exposed by the Copilot website, open each chat, extract visible user/agent turns, and add them to the same library. The manager selector includes both `local` and `copilot-import` histories.
 
-The redundant per-row Browser Action column has been removed. Workspace navigation is global, not a session action.
+Select any conversation, then select any user turn under **Start from**. **Preview** shows the exact monolithic assistant content that will be returned.
 
-Stopping is graceful: the API stops accepting work, the browser receives `Browser.close`, and the manager waits up to `COPILOT_EDGE_GRACEFUL_CLOSE_TIMEOUT` (default 30 seconds) for Edge to write its profile and exit naturally. Force termination is used only after that timeout. This prevents the recurring **Restore pages / Edge closed unexpectedly** prompt during normal manager shutdown.
+### Armed replay
 
-The **Processes…** dialog still lists active and stale process groups across the base and isolated profiles; active session groups are protected.
+Click **Arm selected** beside an endpoint. Its first request atomically consumes the armed replay and streams one ordinary assistant `content` response:
 
-Install dependencies and start:
+```text
+[COPILOT_REPLAY v1 rpl_<random token>]
 
-```powershell
-pip install -r requirements.txt
-python manager.py
+## Previous Conversation
+### User
+...
+### Agent
+...
+
+## Current Query
+### User
+<the request that just arrived>
+
+## Current Response
+### Agent
+<live Copilot output continues here>
 ```
+
+The replay begins at the selected user message. The current query is still sent to Copilot exactly once. While Copilot generates, the endpoint streams the history prefix first, then forwards the live answer. Non-streaming requests receive the same text as one response.
+
+If the client later sends that monolithic assistant message back in `messages[]`, the endpoint recognizes the replay token, discards the synthetic transcript for website prompting, resolves the original structured history and chat URL, and sends only the newest user query to the existing Copilot chat.
+
+Replay tokens are endpoint-bound and persisted. Armed state is one-shot; two simultaneous requests cannot consume it twice. **Disarm** cancels an unused replay.
+
+### Website structure and repair record
+
+`AGENTS.md` records the dated Copilot URL and DOM assumptions, import selectors, prior structural observations, and a repair procedure. Future agents should append a dated entry instead of replacing historical selector information. Import failures are explicit and logged; empty chats are not silently accepted.
 
 ## Use from any OpenAI client
 

@@ -23,8 +23,9 @@ INCLUDE_REASONING = _flag("COPILOT_INCLUDE_REASONING", "1")
 # (inspect the "Thinking..." / "Reasoned for Ns" section of a reply) and adjust.
 REASONING_SEL     = _env("COPILOT_REASONING_SEL",
                          '[data-testid*="reasoning" i], [data-testid*="thinking" i], '
-                         '[data-testid*="chain-of-thought" i], [class*="reasoning" i], '
-                         '[class*="thinking" i], [class*="ChainOfThought"]')
+                         '[data-testid*="thought" i], [data-testid*="chain-of-thought" i], '
+                         '[aria-label*="reasoning" i], [aria-label*="thinking" i], '
+                         '[class*="reasoning" i], [class*="thinking" i], [class*="ChainOfThought"]')
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------

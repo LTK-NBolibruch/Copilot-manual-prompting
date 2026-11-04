@@ -26,6 +26,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import config
+from replay import replay_prefix
 import procs
 from conversations import (ConversationStore, fingerprint, history_key, log_conversation, strip_reasoning,
                            text_of)
@@ -111,7 +112,8 @@ def result_timeout():
 
 class Handler(BaseHTTPRequestHandler):
     session: CopilotSession = None
-    store: ConversationStore = None   # None = resuming disabled
+    store: ConversationStore = None
+    replay = None   # None = resuming disabled
     protocol_version = "HTTP/1.1"
     server_version = "CopilotLocal/2.0"
 
@@ -186,6 +188,19 @@ class Handler(BaseHTTPRequestHandler):
         A returned chat is claimed; _submit releases it when the reply is done."""
         if self.store is None:
             return None
+        # A prior monolithic replay returned by this endpoint identifies the authoritative
+        # structured history and Copilot chat. Never paste that synthetic transcript into Copilot.
+        if self.replay is not None:
+            token = self.replay.find_marker(messages)
+            resolved = self.replay.resolve_messages(token) if token else None
+            if resolved and resolved["port"] == self.port:
+                h = resolved["history"]
+                new_user = next((text_of(m.get("content")).strip() for m in reversed(messages)
+                                 if m.get("role") == "user"), "")
+                if h.get("chat_url") and self.store.claim(h["chat_url"]):
+                    return {"url": h["chat_url"], "turns": len(h["messages"]) // 2,
+                            "reply_hash": "", "model": h.get("model"), "prompt": new_user,
+                            "replay_token": token, "skip_reply_check": True}
         msgs = clean_messages(messages)
         if len(msgs) < 3 or msgs[-1].get("role", "user") != "user" or msgs[-2].get("role") != "assistant":
             return None
@@ -227,8 +242,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
             turns = resume["turns"] + 1 if getattr(fut, "resumed", False) and resume else 1
             history = clean_messages(messages)
+            if self.replay is not None and resume and resume.get("replay_token"):
+                canonical = self.replay.canonical_after_replay(resume["replay_token"], messages)
+                if canonical is not None:
+                    history = canonical
             self.store.put(history_key(history + [{"role": "assistant", "content": reply}]),
                            fut.chat_url, turns, fingerprint(fut.answer_plain), getattr(fut, "model", None))
+            if self.replay is not None:
+                self.replay.upsert(history + [{"role": "assistant", "content": reply}], fut.chat_url,
+                                   getattr(fut, "model", None), not getattr(fut, "truncated", False))
         except Exception:
             log.exception("Could not record the conversation (the reply was still sent)")
 
@@ -299,8 +321,11 @@ class Handler(BaseHTTPRequestHandler):
         created = int(time.time())
         t0 = time.time()
 
+        armed = self.replay.consume(self.port) if self.replay is not None else None
+        prefix = replay_prefix(armed["token"], self.replay.slice(armed),
+                               text_of(messages[-1].get("content")).strip()) if armed else ""
         if body.get("stream"):
-            return self._stream(prompt, resume, select, messages, requested, cid, created, body, t0)
+            return self._stream(prompt, resume, select, messages, requested, cid, created, body, t0, prefix)
 
         try:
             fut = self._submit(prompt, resume, select)
@@ -311,7 +336,10 @@ class Handler(BaseHTTPRequestHandler):
                 log.exception("Unhandled error")
             return self._error(status, str(e), etype, code)
 
-        self._record(messages, fut, text, resume)
+        actual_text = text
+        self._record(messages, fut, actual_text, resume)
+        if prefix:
+            text = prefix + actual_text
         reason = finish_reason(fut)
         log.info(":%d completion %s %.1fs in=%d out=%d chars finish=%s %s model=%s", self.port,
                  cid, time.time() - t0, len(prompt), len(text), reason,
@@ -324,107 +352,76 @@ class Handler(BaseHTTPRequestHandler):
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         })
 
-    def _stream(self, prompt, resume, select, messages, model, cid, created, body, t0):
-        """Live Server-Sent Events.
-
-        The worker pushes each new piece of Copilot's reply into a queue as it
-        appears on the page and, when the reply ends, whatever the client has
-        not received yet. This thread forwards them as chat.completion.chunk
-        events, with keep-alive comments while idle. The stream always ends
-        with a final chunk or an error event, then [DONE].
-        """
+    def _stream(self, prompt, resume, select, messages, model, cid, created, body, t0, prefix=""):
+        """SSE transport is independent of replay/persistence; Copilot finishes after disconnect."""
         events: "queue.Queue" = queue.Queue()
-        try:
-            fut = self._submit(prompt, resume, select, on_delta=events.put)
-        except Exception as e:
-            status, etype, code = error_status(e)
-            return self._error(status, str(e), etype, code)
-        # Runs after the worker's last on_delta call, so _DONE is always queued last.
-        fut.add_done_callback(lambda _f: events.put(_DONE))
-
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("X-Accel-Buffering", "no")
         self.send_header("Connection", "close")
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.close_connection = True
-
+        self.end_headers(); self.wfile.flush(); self.close_connection = True
+        log.info(":%d stream %s accepted%s", self.port, cid, " with armed replay" if prefix else "")
         def send(obj):
-            self.wfile.write(f"data: {json.dumps(obj)}\n\n".encode())
-            self.wfile.flush()
-
+            self.wfile.write(f"data: {json.dumps(obj)}\n\n".encode()); self.wfile.flush()
         def chunk(delta, finish=None):
-            send({"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
-                  "system_fingerprint": None,
-                  "choices": [{"index": 0, "delta": delta, "logprobs": None, "finish_reason": finish}]})
-
-        first_token_at, sent = None, []
-        deadline = t0 + result_timeout() + 30
+            send({"id":cid,"object":"chat.completion.chunk","created":created,"model":model,
+                  "system_fingerprint":None,"choices":[{"index":0,"delta":delta,"logprobs":None,"finish_reason":finish}]})
+        client_connected=True; fut=None; sent=[]; first_token_at=None
         try:
+            chunk({"role":"assistant","content":""})
+            if prefix:
+                sent.append(prefix); chunk({"content":prefix}); log.info(":%d stream %s replay prefix sent",self.port,cid)
             try:
-                chunk({"role": "assistant", "content": ""})
-                while True:
+                fut=self._submit(prompt,resume,select,on_delta=events.put)
+                log.info(":%d stream %s Copilot request submitted",self.port,cid)
+            except Exception as exc:
+                status,etype,code=error_status(exc);send({"error":{"message":str(exc),"type":etype,"param":None,"code":code}})
+                self.wfile.write(b"data: [DONE]\n\n");self.wfile.flush();return
+            fut.add_done_callback(lambda _f: events.put(_DONE))
+            deadline=t0+result_timeout()+30
+            while True:
+                try:item=events.get(timeout=KEEPALIVE_SECONDS)
+                except queue.Empty:
+                    if time.time()>deadline:raise TimeoutError("No end of reply from the browser worker in time.")
+                    if not self.session.alive:raise CopilotError("The browser worker stopped; restart the server.")
+                    self.wfile.write(b": keep-alive\n\n");self.wfile.flush();continue
+                if item is _DONE:break
+                if first_token_at is None:first_token_at=time.time();log.info(":%d stream %s first live delta",self.port,cid)
+                sent.append(item);chunk({"content":item})
+            exc=fut.exception(timeout=0) if fut.done() else TimeoutError("Reply did not finish.")
+            if exc:raise exc
+            if not getattr(fut,"streamed_text","") and fut.result():sent.append(fut.result());chunk({"content":fut.result()})
+            reason=finish_reason(fut);chunk({},reason);log.info(":%d stream %s final chunk sent",self.port,cid)
+            if (body.get("stream_options") or {}).get("include_usage"):
+                send({"id":cid,"object":"chat.completion.chunk","created":created,"model":model,"choices":[],
+                      "usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}})
+            self.wfile.write(b"data: [DONE]\n\n");self.wfile.flush();log.info(":%d stream %s [DONE] sent",self.port,cid)
+        except (BrokenPipeError,ConnectionResetError,ConnectionAbortedError):
+            client_connected=False;log.warning("client disconnected during %s; Copilot will finish",cid)
+        except Exception as exc:
+            status,etype,code=error_status(exc);log.warning(":%d stream %s failed: %s",self.port,cid,exc)
+            try:send({"error":{"message":str(exc),"type":etype,"param":None,"code":code}});self.wfile.write(b"data: [DONE]\n\n");self.wfile.flush()
+            except Exception:pass
+        finally:
+            if fut is not None:
+                def persist(done):
                     try:
-                        item = events.get(timeout=KEEPALIVE_SECONDS)
-                    except queue.Empty:
-                        if time.time() > deadline:
-                            raise TimeoutError("No end of reply from the browser worker in time.")
-                        if not self.session.alive:
-                            raise CopilotError("The browser worker stopped; restart the server.")
-                        # keep-alive comment so clients/proxies don't drop an idle connection
-                        self.wfile.write(b": keep-alive\n\n")
-                        self.wfile.flush()
-                        continue
-                    if item is _DONE:
-                        break
-                    if first_token_at is None:
-                        first_token_at = time.time()
-                    sent.append(item)
-                    chunk({"content": item})
-
-                exc = fut.exception(timeout=0) if fut.done() else TimeoutError("Reply did not finish.")
-                if exc:
-                    raise exc
-                # If nothing was streamed, send the whole reply at once.
-                if not sent and fut.result():
-                    sent.append(fut.result())
-                    chunk({"content": fut.result()})
-                client_text = "".join(sent)
-                self._record(messages, fut, client_text, resume)
-                reason = finish_reason(fut)
-                chunk({}, reason)
-                if (body.get("stream_options") or {}).get("include_usage"):
-                    send({"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
-                          "choices": [], "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}})
-                ttft = f"{first_token_at - t0:.1f}s" if first_token_at else "n/a"
-                log.info(":%d stream %s %.1fs first-text=%s in=%d streamed=%d final=%d chars finish=%s %s model=%s",
-                         self.port, cid, time.time() - t0, ttft, len(prompt), len(client_text), len(fut.result()),
-                         reason, "resumed" if getattr(fut, "resumed", False) else "new-chat",
-                         getattr(fut, "model", None))
-            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-                raise
-            except Exception as exc:  # anything else: tell the client, then end the stream properly
-                status, etype, code = error_status(exc)
-                if status == 500:
-                    log.exception("stream %s: unexpected error", cid)
-                else:
-                    log.warning(":%d stream %s failed: %d %s: %s", self.port, cid, status, code, exc)
-                send({"error": {"message": str(exc), "type": etype, "param": None, "code": code}})
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-            log.warning("client disconnected during %s (Copilot will finish the reply in the background)", cid)
+                        if done.cancelled() or done.exception() is not None:return
+                        self._record(messages,done,done.result(),resume);log.info(":%d stream %s history persisted",self.port,cid)
+                    except Exception:log.exception("stream %s persistence failed",cid)
+                if fut.done():persist(fut)
+                else:fut.add_done_callback(persist)
 
     def log_message(self, fmt, *args):
         log.info(":%d %s - %s", self.port, self.client_address[0], fmt % args)
 
 
-def make_server(port, session=None, store=None, serve=True, host=None):
+def make_server(port, session=None, store=None, serve=True, host=None, replay=None):
     """An API server on `port` for one session. Raises OSError if the port is taken.
     serve=False binds the port without answering yet (set .RequestHandlerClass.session, then serve())."""
-    handler = type(f"Handler{port}", (Handler,), {"session": session, "store": store})
+    handler = type(f"Handler{port}", (Handler,), {"session": session, "store": store, "replay": replay})
     httpd = ThreadingHTTPServer((host or config.HOST, port), handler)
     if serve:
         serve_in_background(httpd)

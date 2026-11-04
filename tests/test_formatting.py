@@ -97,3 +97,8 @@ def test_debug_dump(tmp_path, monkeypatch):
     session()._wait_for_completion(Page({"text": "Headway", "clean": "Headway", "blocks": BLOCKS}), new_future())
     files = sorted(os.listdir(tmp_path / "replies"))
     assert [f.rsplit(".", 1)[1] for f in files] == ["html", "md", "txt"]
+
+def test_div_based_copilot_code_widget_becomes_fenced_block():
+    html='<div data-testid="code-block"><code class="language-python">def run_sdr(trip_id):\n    return trip_id</code></div>'
+    md=html_to_md(html)
+    assert md.startswith('```python\n') and '    return trip_id' in md and md.endswith('\n```')

@@ -88,8 +88,10 @@ log = logging.getLogger("copilot")
 
 try:
     from markdownify import markdownify as _to_md
+    from bs4 import BeautifulSoup
 except ImportError:  # optional dependency
     _to_md = None
+    BeautifulSoup = None
 
 # Keep tabs that aren't in front running at full speed (several sessions = several tabs).
 BROWSER_ARGS = ["--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows",
@@ -554,7 +556,9 @@ SNAPSHOT_JS = r"""
     if (r.idx >= 0) el = all[r.idx];
     if (rsel) {
       const rNew = [...document.querySelectorAll(rsel)].filter(e => !e.closest('[' + MARK + ']') && after(anchor, e));
-      reasoning = rNew.filter(e => !rNew.some(x => x !== e && x.contains(e))).map(pick).filter(Boolean).join('\n\n');
+      reasoning = rNew.filter(e => !rNew.some(x => x !== e && x.contains(e))).map(pick)
+        .map(t => t.replace(/^(thinking|reasoning|thought process)(?:…|\.\.\.)?\s*/i, '').trim())
+        .filter(Boolean).join('\n\n');
     }
   } else {
     for (let i = all.length - 1; i >= 0 && !el; i--) if (!items[i].inUser && !items[i].inReasoning) el = all[i];
@@ -673,9 +677,29 @@ def _code_language(el) -> str:
     return ""
 
 
+def _normalize_code_html(html: str) -> str:
+    if BeautifulSoup is None or not html.lstrip().startswith("<"):
+        return html
+    soup = BeautifulSoup(html, "html.parser")
+    selectors = ('[data-testid*="code" i], [class*="code-block" i], '
+                 '[class*="codeBlock"], [role="code"], [aria-label*="code block" i]')
+    for node in list(soup.select(selectors)):
+        if node.name == "pre" or node.find_parent("pre"):
+            continue
+        code = node.find("code")
+        if code is None:
+            continue
+        pre = soup.new_tag("pre"); clone = soup.new_tag("code")
+        clone.string = code.get_text("", strip=False)
+        clone["class"] = code.get("class", []) + node.get("class", [])
+        pre.append(clone); node.replace_with(pre)
+    return str(soup)
+
+
 def html_to_md(html: str) -> str:
     if not html.lstrip().startswith("<"):
         return html.strip()
+    html = _normalize_code_html(html)
     return _to_md(html, heading_style="ATX", bullets="-", escape_underscores=False,
                   code_language_callback=_code_language).strip()
 
@@ -884,6 +908,12 @@ class CopilotSession:
     def ask(self, prompt: str, timeout: float | None = None, model: str | None = None) -> str:
         return self.submit(prompt, model=model).result(timeout=timeout or self.result_timeout())
 
+    def import_copilot_history(self) -> Future:
+        """Import every conversation link currently exposed by Copilot's history navigation."""
+        fut = Future()
+        self._q.put(("import_history", fut))
+        return fut
+
     def submit(self, prompt: str, on_delta=None, resume=None, model: str | None = None) -> Future:
         """Queue a prompt without blocking; returns a Future.
 
@@ -1017,6 +1047,12 @@ class CopilotSession:
                 item = self._q.get()
                 if item is None or self.aborted:
                     break
+                if item[0] == "import_history":
+                    fut = item[1]
+                    if fut.set_running_or_notify_cancel():
+                        try: fut.set_result(self._import_copilot_history(page))
+                        except Exception as e: fut.set_exception(e)
+                    continue
                 if item[0] == "models":
                     fut = item[1]
                     if fut.set_running_or_notify_cancel():
@@ -1055,12 +1091,12 @@ class CopilotSession:
                 return
             if item and item[0] == "prompt":
                 fut = item[2]
-            elif item and item[0] == "models":
+            elif item and item[0] in ("models", "import_history"):
                 fut = item[1]
             else:
                 continue
             if fut.set_running_or_notify_cancel():
-                if item[0] == "models":
+                if item[0] in ("models", "import_history"):
                     fut.set_result([])
                 else:
                     fut.set_exception(SessionCancelled("The session was stopped before this prompt ran."))
@@ -1068,6 +1104,48 @@ class CopilotSession:
     def _visible(self) -> bool:
         f = getattr(self, "_is_visible", None)
         return bool(f()) if f else self.show_window
+
+    def _import_copilot_history(self, page):
+        """Open each history link and extract visible user/agent turns.
+
+        Selectors are deliberately layered and documented in AGENTS.md. Items with no extractable
+        turns are returned as errors instead of silently saved as empty conversations.
+        """
+        current = page.url
+        links = page.evaluate("""() => {
+          const all=[...document.querySelectorAll('a[href*="/chat/conversation/"]')];
+          const seen=new Set(); return all.map(a=>({url:a.href,title:(a.innerText||a.textContent||'').trim()}))
+            .filter(x=>x.url&&!seen.has(x.url)&&seen.add(x.url));
+        }""")
+        if conversation_url(current) and not any(x["url"] == conversation_url(current) for x in links):
+            links.insert(0, {"url": conversation_url(current), "title": "Current conversation"})
+        out=[]
+        for link in links:
+            self._check_abort()
+            try:
+                page.goto(link["url"], wait_until="domcontentloaded", timeout=45000)
+                page.wait_for_timeout(1200)
+                turns = page.evaluate("""() => {
+                  const roleOf=e => {
+                    const s=((e.getAttribute('data-testid')||'')+' '+(e.getAttribute('aria-label')||'')+' '+e.className).toLowerCase();
+                    if(/user|prompt|request/.test(s)) return 'user';
+                    if(/assistant|copilot|response|answer/.test(s)) return 'assistant';
+                    return '';
+                  };
+                  const sels=['[data-testid*="message"]','[data-testid*="turn"]','article','[role="article"]'];
+                  const nodes=[...document.querySelectorAll(sels.join(','))]; const out=[]; const seen=new Set();
+                  for(const n of nodes){const role=roleOf(n);const text=(n.innerText||'').trim();
+                    if(role&&text&&text.length>1&&!seen.has(role+'\0'+text)){const cleaned=text.replace(/^(you said|copilot said|you|user|copilot|agent|assistant)\s*:\s*/i,'').trim();if(cleaned){seen.add(role+'\0'+cleaned);out.push({role,content:cleaned});}}}
+                  return out;
+                }""")
+                if not turns: raise CopilotError("no conversation turns matched the documented selectors")
+                out.append({"url": conversation_url(page.url) or link["url"], "title": link["title"], "messages": turns})
+            except Exception as e:
+                out.append({"url": link["url"], "title": link["title"], "error": str(e)})
+        if current:
+            try: page.goto(current, wait_until="domcontentloaded", timeout=45000)
+            except Exception: pass
+        return out
 
     def _stream_mode(self):
         if config.STREAM_MODE == "markdown" and _to_md is None:
@@ -1363,6 +1441,8 @@ class CopilotSession:
                 break
             prev = text
             time.sleep(0.5 if config.POLL_INTERVAL >= 0.5 else config.POLL_INTERVAL)
+        if resume.get("skip_reply_check"):
+            return True
         if fingerprint(prev or "") != resume["reply_hash"]:
             log.info("Chat %s has moved on or changed since it was recorded (client regenerated or edited "
                      "a reply?) - starting a new chat", url)

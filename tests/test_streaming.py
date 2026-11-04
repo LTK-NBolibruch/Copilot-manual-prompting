@@ -324,3 +324,10 @@ def test_long_reasoning_phase_does_not_finish_reply(monkeypatch):
     snaps = [{"reasoning": "step"}] * 80 + [{"reasoning": "step done", "answer": "Final answer."}]
     got, result, _ = run(FakePage(snaps, generating_until=0), "text", monkeypatch)
     assert result.endswith("Final answer.") and "".join(got) == result
+
+def test_collapsed_reasoning_is_tagged_before_answer(monkeypatch):
+    snaps=[{'reasoning':'Thinking... Checking the relevant code.','answer':''},
+           {'reasoning':'Thinking... Checking the relevant code.','answer':'Use this.'}]
+    got,result,_=run(FakePage(snaps,generating_until=2),'text',monkeypatch)
+    assert result.startswith('<think>\n') and '\n</think>\n\nUse this.' in result
+    assert ''.join(got)==result
