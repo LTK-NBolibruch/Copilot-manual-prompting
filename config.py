@@ -109,6 +109,12 @@ INPUT_SEL   = _env("COPILOT_INPUT_SEL", '#m365-chat-editor-target-element, texta
 REPLY_SEL   = _env("COPILOT_REPLY_SEL", '[data-testid="markdown-reply"], .fai-ChatMessage__content')
 SEND_SEL    = _env("COPILOT_SEND_SEL", 'button[title*="Submit"], button[aria-label*="Send"]')
 STOP_SEL    = _env("COPILOT_STOP_SEL", 'button[aria-label*="Stop"]')  # verify in DevTools
+TRY_AGAIN_SEL = _env("COPILOT_TRY_AGAIN_SEL",
+    'button:has-text("Try Again"), button:has-text("Try again"), '
+    '[role="button"]:has-text("Try Again"), [role="button"]:has-text("Try again")')
+TRY_AGAIN_DELAY = _env("COPILOT_TRY_AGAIN_DELAY", 2.0, float)
+TRY_AGAIN_MAX   = _env("COPILOT_TRY_AGAIN_MAX", 3, int)
+AUTO_TRY_AGAIN  = _flag("COPILOT_AUTO_TRY_AGAIN", "0")
 POPOVER_SEL = _env("COPILOT_POPOVER_SEL", "button.fai-next, .fui-TeachingPopover button")
 # Your own messages in the chat. REPLY_SEL can also match them; anything inside these is never
 # treated as Copilot's reply. Best guess - verify in DevTools. (Your message is also recognised

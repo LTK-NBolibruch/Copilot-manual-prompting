@@ -61,6 +61,21 @@ def clean_messages(messages):
     return out
 
 
+RETRY_COMMANDS = {"TRY AGAIN", "ALWAYS TRY AGAIN", "DISABLE ALWAYS TRY AGAIN"}
+
+def canonical_retry_history(messages):
+    """Remove endpoint retry controls and their synthetic guidance from durable history."""
+    out=[]
+    for m in clean_messages(messages):
+        text=text_of(m.get("content")).strip()
+        if m.get("role")=="user" and " ".join(text.upper().split()) in RETRY_COMMANDS:
+            continue
+        if m.get("role")=="assistant" and "Reply with **TRY AGAIN**" in text:
+            continue
+        out.append(m)
+    return out
+
+
 def flatten_messages(messages):
     """Turn an OpenAI messages[] list into one Copilot prompt for a NEW chat.
 
@@ -241,7 +256,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.store is None or not getattr(fut, "chat_url", None) or not getattr(fut, "answer_plain", ""):
                 return
             turns = resume["turns"] + 1 if getattr(fut, "resumed", False) and resume else 1
-            history = clean_messages(messages)
+            history = canonical_retry_history(messages)
             if self.replay is not None and resume and resume.get("replay_token"):
                 canonical = self.replay.canonical_after_replay(resume["replay_token"], messages)
                 if canonical is not None:

@@ -866,6 +866,7 @@ class CopilotSession:
         self._aborted = False
         self._md_cache: dict[str, str] = {}
         self._warned_no_stop = False
+        self.auto_try_again = config.AUTO_TRY_AGAIN
         self._prompt_norm = ""            # your current prompt, normalized (to recognise its bubble)
         self._models = {"names": configured_models(), "current": None, "fetched": 0.0,
                         "source": "config" if configured_models() else "none",
@@ -1449,6 +1450,42 @@ class CopilotSession:
             return False
         return True
 
+    @staticmethod
+    def retry_guidance(error_text=""):
+        lead = (error_text.strip() + "\n\n") if error_text and error_text.strip().lower() != "try again" else ""
+        return (lead + "Copilot could not complete this response. Reply with **TRY AGAIN** to retry once, "
+                "or **ALWAYS TRY AGAIN** to retry this and future Copilot errors automatically. "
+                "Reply with **DISABLE ALWAYS TRY AGAIN** to turn automatic retry off.")
+
+    def _retry_button(self, page):
+        try:
+            b = page.locator(config.TRY_AGAIN_SEL).last
+            return b if b.count() else None
+        except Exception:
+            return None
+
+    def _click_try_again(self, page, delay=None):
+        button = self._retry_button(page)
+        if button is None:
+            return False
+        wait = config.TRY_AGAIN_DELAY if delay is None else delay
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            self._check_abort(); time.sleep(min(0.2, deadline - time.time()))
+        page.evaluate(MARK_JS, [config.REPLY_SEL, config.REASONING_SEL, RELAY_MARK])
+        button.click(timeout=5000)
+        log.info("Clicked Copilot Try Again")
+        return True
+
+    def _retry_existing(self, page, fut, on_delta=None):
+        if not self._click_try_again(page, delay=0.1):
+            text = "No Copilot **Try Again** action is currently available."
+            self._emit(fut, on_delta, text)
+            fut.answer_plain = text
+            return text
+        self._prompt_norm = ""
+        return self._wait_for_completion(page, fut, on_delta)
+
     def _ask(self, page, prompt: str, fut: Future, on_delta=None, resume=None, model=None) -> str:
         resumed = False
         if resume:
@@ -1477,6 +1514,18 @@ class CopilotSession:
 
         # A visible Copilot editor is proof that this session is operationally authenticated.
         self._set_auth("signed_in", authoritative=True)
+
+        command = " ".join(prompt.upper().split())
+        if command == "DISABLE ALWAYS TRY AGAIN":
+            self.auto_try_again = False
+            text = "Automatic Copilot retry is now disabled for this session."
+            self._emit(fut, on_delta, text); fut.answer_plain = text
+            return text
+        if command in ("TRY AGAIN", "ALWAYS TRY AGAIN"):
+            if command == "ALWAYS TRY AGAIN":
+                self.auto_try_again = True
+                log.info("Automatic Copilot Try Again enabled for this session")
+            return self._retry_existing(page, fut, on_delta)
 
         if model:
             self._select_model(page, model)
@@ -1598,6 +1647,7 @@ class CopilotSession:
         reasoning_best, r_sent = "", ""          # longest reasoning seen / reasoning streamed
         think = "none"                           # none -> open -> closed
         stop_seen, ended = False, "timeout"
+        retry_count = 0
         t_start = time.time()
         last_change = t_start
         deadline = t_start + config.REPLY_TIMEOUT
@@ -1613,6 +1663,24 @@ class CopilotSession:
 
         while time.time() < deadline:
             self._check_abort()
+            retry_button = self._retry_button(page)
+            if retry_button is not None:
+                already_sent = bool(r_sent or tracker.sent or blocks.sent)
+                if self.auto_try_again and not already_sent and retry_count < config.TRY_AGAIN_MAX:
+                    retry_count += 1
+                    log.warning("Copilot displayed Try Again; automatic retry %d/%d in %.1fs",
+                                retry_count, config.TRY_AGAIN_MAX, config.TRY_AGAIN_DELAY)
+                    if self._click_try_again(page):
+                        last = {"reasoning": None, "text": None, "clean": "", "blocks": []}
+                        reasoning_best = r_sent = ""; tracker, blocks = DeltaTracker(), BlockStreamer()
+                        think = "none"; stop_seen = False; last_change = time.time()
+                        continue
+                # A partial answer cannot be retracted from an SSE client. Ask for an explicit retry.
+                try: error_text = retry_button.evaluate("e => (e.closest('[role=alert], [data-testid*=error i]') || e.parentElement || e).innerText || ''")
+                except Exception: error_text = ""
+                guidance = self.retry_guidance(error_text)
+                emit(guidance); fut.answer_plain = guidance
+                return guidance
             snap = self._snapshot(page)
             reasoning, text, blocks_html = snap["reasoning"], snap["text"], snap["blocks"]
             now = time.time()

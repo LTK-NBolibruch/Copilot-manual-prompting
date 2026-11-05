@@ -517,3 +517,10 @@ def test_openai_sdk(url):
                   c.chat.completions.create(model="m", stream=True, messages=[{"role": "user", "content": "hi"}])
                   if ch.choices)
     assert out == "".join(PIECES)
+
+def test_retry_control_messages_are_not_persisted():
+    from server import canonical_retry_history
+    msgs=[{'role':'user','content':'real question'},
+          {'role':'assistant','content':'Copilot failed. Reply with **TRY AGAIN** to retry once.'},
+          {'role':'user','content':'TRY AGAIN'}]
+    assert canonical_retry_history(msgs)==[{'role':'user','content':'real question'}]

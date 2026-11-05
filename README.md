@@ -309,3 +309,20 @@ python ask.py --model "Think deeper" "Compare T0 and T1 batch mode"
 - **Re-sign-in.** Stop the server or manager, run `python ask.py --show "Reply with OK"`, then start it again.
 - **Settings.** Selectors, timeouts, poll intervals, stream mode, reasoning tags, models, conversation resuming, debugging, port and model ID are in `config.py`, and each can be overridden with a `COPILOT_*` environment variable.
 - **Tests.** Run `pytest -q`. The browser is mocked; reply reading, formatting, streaming, model selection, chat resuming, running several sessions, cancelling and removing sessions, starting Edge, and finding and ending leftover processes are tested against simulated pages and processes. The reply-picking logic runs in Node, which is skipped if `node` isn't installed. The process tests start stand-in processes and are skipped on Windows. The browser-side scripts, the real Edge, the Windows-only process code (PowerShell listing, `taskkill`, the job object) and the window have not been tested on a real machine.
+
+### Copilot `Try Again` errors
+
+When Copilot displays an error card with **Try Again**, manual mode returns a normal assistant message:
+
+```text
+Copilot could not complete this response. Reply with TRY AGAIN to retry once, or ALWAYS TRY AGAIN
+to retry this and future Copilot errors automatically. Reply with DISABLE ALWAYS TRY AGAIN to turn
+automatic retry off.
+```
+
+These exact all-caps messages are endpoint controls and are not sent to Copilot or stored in durable
+history. Automatic mode waits 2 seconds before clicking the website button and attempts at most three
+times per response. Configure `COPILOT_TRY_AGAIN_DELAY`, `COPILOT_TRY_AGAIN_MAX`,
+`COPILOT_TRY_AGAIN_SEL`, or start with automatic mode via `COPILOT_AUTO_TRY_AGAIN=1`.
+If part of an answer was already streamed, the endpoint does not silently retry because SSE text
+cannot be retracted; it returns the manual instruction instead.

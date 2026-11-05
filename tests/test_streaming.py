@@ -331,3 +331,7 @@ def test_collapsed_reasoning_is_tagged_before_answer(monkeypatch):
     got,result,_=run(FakePage(snaps,generating_until=2),'text',monkeypatch)
     assert result.startswith('<think>\n') and '\n</think>\n\nUse this.' in result
     assert ''.join(got)==result
+
+def test_retry_guidance_commands():
+    text=CopilotSession.retry_guidance('Try Again')
+    assert '**TRY AGAIN**' in text and '**ALWAYS TRY AGAIN**' in text and '**DISABLE ALWAYS TRY AGAIN**' in text
