@@ -78,3 +78,12 @@ future repair can compare past and present DOM structure.
   clicks the website button, and retries up to `COPILOT_TRY_AGAIN_MAX` (default 3). Retry controls and
   synthetic guidance are excluded from durable conversation history. `DISABLE ALWAYS TRY AGAIN`
   turns automatic retry off for that session.
+
+- **2026-11-04, v31**: Recorded the actual virtualized code widget structure: complete host
+  `[aria-label="Code Preview"]` / `id^="code-block-host-"`; language label under
+  `[data-testid="one-copilot-code-identity"] span`; source rows under
+  `[role="textbox"][aria-label="Code editor"] [data-line-index]`; blank rows use
+  `data-line-empty`. The widget has no `<code>` element. Snapshot normalization now reconstructs an
+  ordered `<pre><code class="language-*">` and replaces the whole host, excluding toolbar labels,
+  SVG text, line-number nodes, and Copy/More-options controls. `C++` maps to `cpp`; `Plain Text`
+  produces an unlabelled fenced block.

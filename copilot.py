@@ -601,6 +601,29 @@ SNAPSHOT_JS = r"""
   });
   each('span[style*="italic"]', n => swap(n, 'em'));
 
+  // Copilot's virtualized Code Preview contains no <code>. Reconstruct source from line rows.
+  const langName = s => { const n=(s||'').trim().toLowerCase().replace(/[^a-z0-9+#.-]/g,'');
+    return ({'c++':'cpp','cplusplus':'cpp','c#':'csharp','csharp':'csharp','plain':'','plaintext':'','plain-text':'','text':''})[n] ?? n; };
+  for (const host of [...c.querySelectorAll('[aria-label="Code Preview"], [id^="code-block-host-"]')]) {
+    if (!host.isConnected || host.closest('pre')) continue;
+    const old=host.querySelector('code'), editor=host.querySelector('[role="textbox"][aria-label="Code editor"]');
+    let source='', cls='';
+    if (old) { source=old.textContent||''; cls=old.className||''; }
+    else if (editor) { const lines=[...editor.querySelectorAll('[data-line-index]')].sort((a,b)=>Number(a.dataset.lineIndex)-Number(b.dataset.lineIndex));
+      source=lines.map(x=>x.hasAttribute('data-line-empty')?'':(x.textContent||'').replace(/\u00a0/g,'')).join('\n'); }
+    else continue;
+    const label=host.querySelector('[data-testid="one-copilot-code-identity"] span')?.textContent||'';
+    const lang=langName(label),pre=document.createElement('pre'),code=document.createElement('code');
+    code.textContent=source;code.className=[lang?`language-${lang}`:'',cls].filter(Boolean).join(' ');
+    pre.appendChild(code);host.replaceWith(pre);
+  }
+  each('[data-testid*="code" i], [class*="code-block" i], [class*="codeBlock"], [role="code"]', n => {
+    if (!n.isConnected || n.tagName==='PRE' || n.closest('pre')) return;
+    const old=n.querySelector('code'); if(!old)return;
+    const pre=document.createElement('pre'),code=document.createElement('code');
+    code.textContent=old.textContent||'';code.className=old.className||'';pre.appendChild(code);n.replaceWith(pre);
+  });
+
   // Descend through single-child wrapper divs to reach the real block list.
   const BLOCK = /^(P|UL|OL|TABLE|PRE|H[1-6]|BLOCKQUOTE|HR)$/;
   let root = c;
@@ -677,22 +700,40 @@ def _code_language(el) -> str:
     return ""
 
 
+def _code_language_name(label: str) -> str:
+    name = re.sub(r"[^a-z0-9+#.-]", "", (label or "").strip().lower())
+    return {"c++":"cpp", "cplusplus":"cpp", "c#":"csharp", "csharp":"csharp",
+            "plain":"", "plaintext":"", "plain-text":"", "text":""}.get(name, name)
+
+
 def _normalize_code_html(html: str) -> str:
+    """Convert semantic and virtualized Copilot Code Preview widgets to pre/code."""
     if BeautifulSoup is None or not html.lstrip().startswith("<"):
         return html
     soup = BeautifulSoup(html, "html.parser")
-    selectors = ('[data-testid*="code" i], [class*="code-block" i], '
-                 '[class*="codeBlock"], [role="code"], [aria-label*="code block" i]')
-    for node in list(soup.select(selectors)):
-        if node.name == "pre" or node.find_parent("pre"):
+    # Select only complete widget hosts first, then older semantic wrappers.
+    hosts = list(soup.select('[aria-label="Code Preview"], [id^="code-block-host-"]'))
+    hosts += [n for n in soup.select('[data-testid*="code" i], [class*="code-block" i], [class*="codeBlock"], [role="code"]')
+              if not n.find_parent(attrs={"aria-label":"Code Preview"})]
+    for host in hosts:
+        if not host.parent or host.find_parent("pre"):
             continue
-        code = node.find("code")
-        if code is None:
+        old = host.find("code")
+        editor = host.select_one('[role="textbox"][aria-label="Code editor"]')
+        if old is not None:
+            source, classes = old.get_text("", strip=False), old.get("class", [])
+        elif editor is not None:
+            lines = sorted(editor.select('[data-line-index]'), key=lambda x:int(x.get('data-line-index','0')))
+            source = "\n".join("" if x.has_attr('data-line-empty') else x.get_text("",strip=False).replace("\xa0","") for x in lines)
+            classes = []
+        else:
             continue
-        pre = soup.new_tag("pre"); clone = soup.new_tag("code")
-        clone.string = code.get_text("", strip=False)
-        clone["class"] = code.get("class", []) + node.get("class", [])
-        pre.append(clone); node.replace_with(pre)
+        identity = host.select_one('[data-testid="one-copilot-code-identity"] span')
+        lang = _code_language_name(identity.get_text(" ",strip=True) if identity else "")
+        pre=soup.new_tag('pre');code=soup.new_tag('code');code.string=source
+        if lang: code['class']=[f'language-{lang}']
+        elif classes: code['class']=classes
+        pre.append(code);host.replace_with(pre)
     return str(soup)
 
 

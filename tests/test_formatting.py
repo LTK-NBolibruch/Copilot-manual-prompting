@@ -102,3 +102,24 @@ def test_div_based_copilot_code_widget_becomes_fenced_block():
     html='<div data-testid="code-block"><code class="language-python">def run_sdr(trip_id):\n    return trip_id</code></div>'
     md=html_to_md(html)
     assert md.startswith('```python\n') and '    return trip_id' in md and md.endswith('\n```')
+
+def test_real_virtualized_copilot_code_preview_becomes_cpp_fence():
+    html='''<div id="code-block-host-_r_od_" role="group" aria-label="Code Preview">
+      <div data-testid="one-copilot-code-identity"><span>C++</span></div>
+      <button aria-label="Copy code">Copy</button>
+      <div role="textbox" aria-readonly="true" aria-multiline="true" aria-label="Code editor">
+        <div data-line-number="1"></div><div data-line-index="0">if (auto action = record-&gt;action()) {</div>
+        <div data-line-number="2"></div><div data-line-index="1">    load_timing(*row);</div>
+        <div data-line-number="3"></div><div data-line-index="2">}</div>
+      </div></div>'''
+    md=html_to_md(html)
+    assert md == '```cpp\nif (auto action = record->action()) {\n    load_timing(*row);\n}\n```'
+    assert 'Copy' not in md and 'C++\n' not in md
+
+
+def test_virtualized_plain_text_is_still_a_fenced_block():
+    html='''<div aria-label="Code Preview"><div data-testid="one-copilot-code-identity"><span>Plain Text</span></div>
+      <div role="textbox" aria-label="Code editor"><div data-line-index="0">Release 496</div>
+      <div data-line-index="1">FAIL</div><div data-line-index="2" data-line-empty="true">&nbsp;</div>
+      <div data-line-index="3">Release 497</div></div></div>'''
+    assert html_to_md(html) == '```\nRelease 496\nFAIL\n\nRelease 497\n```'
